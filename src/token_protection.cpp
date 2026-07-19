@@ -7,6 +7,7 @@
 #include "crypto/common.h"
 #include "crypto/sha256.h"
 
+#include <algorithm>
 #include <limits>
 #include <map>
 
@@ -124,15 +125,18 @@ bool ParseScriptChunks(const CScript& script, std::vector<ScriptChunk>& chunks) 
     return true;
 }
 
-//! Match tape outputs of the form `OP_FALSE OP_RETURN ... <flag>`.
+//! Match raw script bytes of the form `OP_FALSE OP_RETURN ... <flag>`.
+//! The flag only needs to be a suffix of the complete script; it does not
+//! need to occupy a standalone push-data chunk.
 bool MatchesTapeFlagPattern(const CScript& lockingScript,
                             const std::vector<uint8_t>& flag) {
-    std::vector<ScriptChunk> chunks;
-    if (!ParseScriptChunks(lockingScript, chunks) || chunks.size() < 3) {
+    if (lockingScript.size() < 2 + flag.size()) {
         return false;
     }
-    return chunks[0].opcode == OP_FALSE && chunks[1].opcode == OP_RETURN &&
-           chunks.back().data == flag;
+    const auto flagBegin =
+        lockingScript.begin() + (lockingScript.size() - flag.size());
+    return lockingScript[0] == OP_FALSE && lockingScript[1] == OP_RETURN &&
+           std::equal(flag.begin(), flag.end(), flagBegin);
 }
 
 //! Match tape outputs of the form `OP_FALSE OP_RETURN ... "NTape"`.
@@ -154,11 +158,8 @@ bool MatchesFTapePattern(const CScript& lockingScript) {
  */
 bool IsPoolNftTapeLayout(const CScript& lockingScript) {
     std::vector<ScriptChunk> chunks;
-    if (!ParseScriptChunks(lockingScript, chunks) || chunks.size() < 6) {
-        return false;
-    }
-    if (chunks[0].opcode != OP_FALSE || chunks[1].opcode != OP_RETURN ||
-        chunks.back().data != NTAPE_FLAG) {
+    if (!MatchesNTapePattern(lockingScript) ||
+        !ParseScriptChunks(lockingScript, chunks) || chunks.size() < 6) {
         return false;
     }
     // chunk[2]=ft_lp||ft_a partialhash(64B), chunk[3]=3x uint64 amount(24B)

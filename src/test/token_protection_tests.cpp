@@ -58,7 +58,8 @@ CScript MakeFTapeScript(std::array<int64_t, 6> amounts) {
 
 //! poolnft layout: OP_FALSE OP_RETURN <64B> <24B amount> <32B> ... "NTape"
 CScript MakePoolNftTapeScript(std::array<int64_t, 3> amounts,
-                              const std::vector<uint8_t>& hashPrefix = {}) {
+                              const std::vector<uint8_t>& hashPrefix = {},
+                              const std::vector<uint8_t>& flagPrefix = {}) {
     std::vector<uint8_t> hash64(64, 0x11);
     if (!hashPrefix.empty()) {
         BOOST_REQUIRE(hashPrefix.size() <= hash64.size());
@@ -67,9 +68,11 @@ CScript MakePoolNftTapeScript(std::array<int64_t, 3> amounts,
     std::vector<uint8_t> amount24 = EncodeLE64Slots(
         std::vector<int64_t>(amounts.begin(), amounts.end()));
     std::vector<uint8_t> txid32(32, 0x22);
+    std::vector<uint8_t> tapeFlag = flagPrefix;
+    tapeFlag.insert(tapeFlag.end(), NTAPE_FLAG.begin(), NTAPE_FLAG.end());
     return CScript() << OP_FALSE << OP_RETURN << hash64 << amount24 << txid32
                      << int64_t{1} << int64_t{0} << int64_t{0} << int64_t{0}
-                     << NTAPE_FLAG;
+                     << tapeFlag;
 }
 
 //! Shares the NTape flag but is not a poolnft layout (e.g. a plain NFT JSON tape)
@@ -100,7 +103,8 @@ CTransactionRef MakePrevTxWithFTape(const CScript& contractScript,
 
 CTransactionRef MakePrevTxWithPoolNftTape(
     std::array<int64_t, 3> amounts,
-    const std::vector<uint8_t>& hashPrefix = {}) {
+    const std::vector<uint8_t>& hashPrefix = {},
+    const std::vector<uint8_t>& flagPrefix = {}) {
     CMutableTransaction prev;
     prev.nVersion = 1;
     prev.vin.resize(1);
@@ -110,7 +114,8 @@ CTransactionRef MakePrevTxWithPoolNftTape(
     prev.vout[0].nValue = Amount(1);
     prev.vout[0].scriptPubKey = MakeContractScript(0x01);
     prev.vout[1].nValue = Amount(0);
-    prev.vout[1].scriptPubKey = MakePoolNftTapeScript(amounts, hashPrefix);
+    prev.vout[1].scriptPubKey =
+        MakePoolNftTapeScript(amounts, hashPrefix, flagPrefix);
     return MakeTransactionRef(prev);
 }
 
@@ -158,6 +163,28 @@ BOOST_AUTO_TEST_CASE(ftape_ntape_pattern_match) {
     BOOST_CHECK(IsNTapeOutput(plainNft));
     BOOST_CHECK(!IsFTapeOutput(ordinary));
     BOOST_CHECK(!IsNTapeOutput(ordinary));
+
+    // The flag is a raw-script suffix and need not be a standalone chunk.
+    std::vector<uint8_t> prefixedFtapeFlag{0xaa, 0xbb};
+    prefixedFtapeFlag.insert(prefixedFtapeFlag.end(), FTAPE_FLAG.begin(),
+                             FTAPE_FLAG.end());
+    const CScript suffixedFtape =
+        CScript() << OP_FALSE << OP_RETURN
+                  << MakeFTapeAmountField({1, 0, 0, 0, 0, 0})
+                  << prefixedFtapeFlag;
+    BOOST_CHECK(IsFTapeOutput(suffixedFtape));
+
+    std::vector<uint8_t> prefixedNtapeFlag{0xcc};
+    prefixedNtapeFlag.insert(prefixedNtapeFlag.end(), NTAPE_FLAG.begin(),
+                             NTAPE_FLAG.end());
+    BOOST_CHECK(IsNTapeOutput(CScript() << OP_FALSE << OP_RETURN
+                                        << std::vector<uint8_t>{0x01}
+                                        << prefixedNtapeFlag));
+
+    std::vector<uint8_t> ftapeWithTrailingByte = FTAPE_FLAG;
+    ftapeWithTrailingByte.push_back(0x00);
+    BOOST_CHECK(!IsFTapeOutput(CScript() << OP_FALSE << OP_RETURN
+                                         << ftapeWithTrailingByte));
 
     // Real FT tape sample (devfiles/tape_style.md)
     const auto realFtapeHex = ParseHex(
@@ -344,6 +371,24 @@ BOOST_AUTO_TEST_CASE(poolnft_tape_tamper_checks) {
     const auto prevTx =
         MakePrevTxWithPoolNftTape(oldAmounts, {/*hashPrefix*/ {0x01}});
     const auto fetcher = MakeFetcher({{prevTx->GetId(), prevTx}});
+
+    // NTape may be only the suffix of the final chunk. PoolNFT layout and
+    // tamper checking must still apply in that representation.
+    {
+        const std::vector<uint8_t> flagPrefix{0xaa, 0xbb};
+        const auto suffixPrev = MakePrevTxWithPoolNftTape(
+            oldAmounts, {/*hashPrefix*/ {0x01}}, flagPrefix);
+        const auto suffixFetcher =
+            MakeFetcher({{suffixPrev->GetId(), suffixPrev}});
+        CMutableTransaction suffixTx;
+        suffixTx.vin.resize(1);
+        suffixTx.vin[0].prevout = COutPoint(suffixPrev->GetId(), 0);
+        suffixTx.vout.resize(2);
+        suffixTx.vout[1].scriptPubKey = MakePoolNftTapeScript(
+            oldAmounts, {/*hashPrefix*/ {0x99}}, flagPrefix);
+        BOOST_CHECK(CheckPoolNftTape(CTransaction(suffixTx), suffixFetcher) ==
+                    TokenCheckResult::POOLNFT_TAPE_TAMPERED);
+    }
 
     // Not a poolnft layout (plain NTape / FTape) -> skipped
     {
