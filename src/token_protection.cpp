@@ -17,6 +17,8 @@ namespace {
 
 //! Token identity (contract partial_hash) -> amount sum
 using TokenAmountMap = std::map<uint256, int64_t>;
+//! Token identity (contract partial_hash) -> number of tape outputs
+using TokenOutputCountMap = std::map<uint256, size_t>;
 
 //! Accumulate non-negative values; returns false on overflow.
 bool SafeAddNonNegative(int64_t& acc, int64_t value) {
@@ -36,7 +38,8 @@ bool SafeAddNonNegative(int64_t& acc, int64_t value) {
  * still verified).
  */
 TokenCheckResult AccumulateTapeAmount(const CTransaction& sourceTx,
-                                      size_t tapeIndex, TokenAmountMap& map) {
+                                      size_t tapeIndex, TokenAmountMap& map,
+                                      TokenOutputCountMap* countMap = nullptr) {
     const CScript& tapeScript = sourceTx.vout[tapeIndex].scriptPubKey;
     if (!IsFTapeOutput(tapeScript)) {
         return TokenCheckResult::OK;
@@ -50,6 +53,9 @@ TokenCheckResult AccumulateTapeAmount(const CTransaction& sourceTx,
     }
     const uint256 tokenId =
         ComputeTokenPartialHash(sourceTx.vout[tapeIndex - 1].scriptPubKey);
+    if (countMap) {
+        ++(*countMap)[tokenId];
+    }
     int64_t& sum = map[tokenId];
     for (const int64_t amount : *amounts) {
         if (!SafeAddNonNegative(sum, amount)) {
@@ -179,6 +185,8 @@ const char* TokenCheckResultToRejectReason(TokenCheckResult result) {
         case TokenCheckResult::NEGATIVE_AMOUNT:
         case TokenCheckResult::AMOUNT_MISMATCH:
             return "bad-txn-token-amount-mismatch";
+        case TokenCheckResult::MINT_MULTIPLE_OUTPUTS:
+            return "bad-txn-token-mint-multiple-outputs";
         case TokenCheckResult::POOLNFT_TAPE_TAMPERED:
             return "bad-txn-poolnft-tape-tampered";
         case TokenCheckResult::PREV_TX_UNAVAILABLE:
@@ -240,10 +248,13 @@ uint256 ComputeTokenPartialHash(const CScript& lockingScript) {
 TokenCheckResult CheckTokenAmountConservation(const CTransaction& tx,
                                               const PrevTxFetcher& prevTxFetcher) {
     // Output side: parse all FTape outputs, verify amounts are non-negative
-    // and build the OutputTokenAmountMap.
+    // and build the OutputTokenAmountMap, counting how many token UTXOs
+    // (tape outputs) each partial_hash produces.
     TokenAmountMap outputMap;
+    TokenOutputCountMap outputCountMap;
     for (size_t i = 0; i < tx.vout.size(); ++i) {
-        const auto result = AccumulateTapeAmount(tx, i, outputMap);
+        const auto result =
+            AccumulateTapeAmount(tx, i, outputMap, &outputCountMap);
         if (result != TokenCheckResult::OK) {
             return result;
         }
@@ -284,7 +295,15 @@ TokenCheckResult CheckTokenAmountConservation(const CTransaction& tx,
     // initpool / adding LP) || input total == output total.
     for (const auto& [tokenId, outputAmount] : outputMap) {
         const auto it = inputMap.find(tokenId);
-        if (it != inputMap.end() && it->second != outputAmount) {
+        if (it == inputMap.end()) {
+            // Mint protection: a freshly minted token (partial_hash absent on
+            // the input side) may only be issued into a single UTXO.
+            if (outputCountMap[tokenId] > 1) {
+                return TokenCheckResult::MINT_MULTIPLE_OUTPUTS;
+            }
+            continue;
+        }
+        if (it->second != outputAmount) {
             return TokenCheckResult::AMOUNT_MISMATCH;
         }
     }

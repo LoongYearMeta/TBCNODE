@@ -305,6 +305,35 @@ BOOST_AUTO_TEST_CASE(amount_conservation_mint_and_transfer) {
                     TokenCheckResult::OK);
     }
 
+    // mint violation: a freshly minted token may only have one UTXO output
+    {
+        CMutableTransaction dummyPrev;
+        dummyPrev.vin.resize(1);
+        dummyPrev.vout.resize(1);
+        dummyPrev.vout[0].scriptPubKey = MakeContractScript(0xcc);
+        const auto dummyRef = MakeTransactionRef(dummyPrev);
+
+        CMutableTransaction mint;
+        mint.vin.resize(1);
+        mint.vin[0].prevout = COutPoint(dummyRef->GetId(), 0);
+        mint.vout.resize(4);
+        mint.vout[0].scriptPubKey = MakeContractScript(0xbb);
+        mint.vout[1].scriptPubKey = MakeFTapeScript({30, 0, 0, 0, 0, 0});
+        mint.vout[2].scriptPubKey = MakeContractScript(0xbb);
+        mint.vout[3].scriptPubKey = MakeFTapeScript({20, 0, 0, 0, 0, 0});
+        BOOST_CHECK(CheckTokenAmountConservation(
+                        CTransaction(mint),
+                        MakeFetcher({{dummyRef->GetId(), dummyRef}})) ==
+                    TokenCheckResult::MINT_MULTIPLE_OUTPUTS);
+
+        // Two different tokens (distinct partial_hash), one UTXO each -> OK
+        mint.vout[2].scriptPubKey = MakeContractScript(0xdd);
+        BOOST_CHECK(CheckTokenAmountConservation(
+                        CTransaction(mint),
+                        MakeFetcher({{dummyRef->GetId(), dummyRef}})) ==
+                    TokenCheckResult::OK);
+    }
+
     // transfer conservation: input 100 -> output 100
     {
         CMutableTransaction transfer;
@@ -314,6 +343,22 @@ BOOST_AUTO_TEST_CASE(amount_conservation_mint_and_transfer) {
         transfer.vout[0].scriptPubKey = contract;
         transfer.vout[1].scriptPubKey = MakeFTapeScript({100, 0, 0, 0, 0, 0});
         BOOST_CHECK(CheckTokenAmountConservation(CTransaction(transfer),
+                                                 fetcher) ==
+                    TokenCheckResult::OK);
+    }
+
+    // transfer split: input 100 -> outputs 60 + 40; multiple outputs are
+    // allowed because the token exists on the input side (not a mint)
+    {
+        CMutableTransaction split;
+        split.vin.resize(1);
+        split.vin[0].prevout = COutPoint(prevTx->GetId(), 0);
+        split.vout.resize(4);
+        split.vout[0].scriptPubKey = contract;
+        split.vout[1].scriptPubKey = MakeFTapeScript({60, 0, 0, 0, 0, 0});
+        split.vout[2].scriptPubKey = contract;
+        split.vout[3].scriptPubKey = MakeFTapeScript({40, 0, 0, 0, 0, 0});
+        BOOST_CHECK(CheckTokenAmountConservation(CTransaction(split),
                                                  fetcher) ==
                     TokenCheckResult::OK);
     }
@@ -474,6 +519,10 @@ BOOST_AUTO_TEST_CASE(check_token_transaction_and_reject_reasons) {
         "bad-txn-token-amount-mismatch");
     BOOST_CHECK_EQUAL(
         std::string(TokenCheckResultToRejectReason(
+            TokenCheckResult::MINT_MULTIPLE_OUTPUTS)),
+        "bad-txn-token-mint-multiple-outputs");
+    BOOST_CHECK_EQUAL(
+        std::string(TokenCheckResultToRejectReason(
             TokenCheckResult::POOLNFT_TAPE_TAMPERED)),
         "bad-txn-poolnft-tape-tampered");
     BOOST_CHECK_EQUAL(
@@ -544,6 +593,37 @@ BOOST_AUTO_TEST_CASE(txnvalidation_rejects_negative_ftape_amount) {
     const CValidationState state = ValidateOne(*validator, spend);
     BOOST_CHECK(!state.IsValid());
     BOOST_CHECK_EQUAL(state.GetRejectReason(), "bad-txn-token-amount-mismatch");
+    BOOST_CHECK_EQUAL(state.GetRejectCode(), REJECT_NONSTANDARD);
+}
+
+BOOST_AUTO_TEST_CASE(txnvalidation_rejects_mint_with_multiple_outputs) {
+    GlobalConfig& config = GlobalConfig::GetConfig();
+    config.SetTokenProtectionEnabled(true);
+
+    // Mint (no token on the input side) issuing the same partial_hash token
+    // into two UTXOs -> rejected.
+    const CScript contract = GetP2PK(coinbaseKey);
+    CMutableTransaction mint;
+    mint.nVersion = 1;
+    mint.vin.resize(1);
+    mint.vin[0].prevout = COutPoint(coinbaseTxns[0].GetId(), 0);
+    mint.vout.resize(4);
+    mint.vout[0].nValue = 25 * COIN;
+    mint.vout[0].scriptPubKey = contract;
+    mint.vout[1].nValue = Amount(0);
+    mint.vout[1].scriptPubKey = MakeFTapeScript({60, 0, 0, 0, 0, 0});
+    mint.vout[2].nValue = 24 * COIN;
+    mint.vout[2].scriptPubKey = contract;
+    mint.vout[3].nValue = Amount(0);
+    mint.vout[3].scriptPubKey = MakeFTapeScript({40, 0, 0, 0, 0, 0});
+    SignP2PKInput(mint, 0, coinbaseTxns[0], coinbaseKey);
+
+    mempool.Clear();
+    auto validator = MakeValidator(config);
+    const CValidationState state = ValidateOne(*validator, mint);
+    BOOST_CHECK(!state.IsValid());
+    BOOST_CHECK_EQUAL(state.GetRejectReason(),
+                      "bad-txn-token-mint-multiple-outputs");
     BOOST_CHECK_EQUAL(state.GetRejectCode(), REJECT_NONSTANDARD);
 }
 

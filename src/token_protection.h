@@ -37,6 +37,7 @@ enum class TokenCheckResult {
     OK,                    //!< Passed (or the transaction is not token related)
     NEGATIVE_AMOUNT,       //!< A tape amount field is negative
     AMOUNT_MISMATCH,       //!< Input/output token amounts of a transfer do not match
+    MINT_MULTIPLE_OUTPUTS, //!< A mint creates more than one UTXO of the same token
     POOLNFT_TAPE_TAMPERED, //!< Non-amount fields of a poolnft tape were tampered with
     PREV_TX_UNAVAILABLE,   //!< Full previous transaction unavailable; check cannot proceed
 };
@@ -80,6 +81,8 @@ uint256 ComputeTokenPartialHash(const CScript& lockingScript);
  * build Input/OutputTokenAmountMap keyed by partial_hash and require, for
  * each output token: the token does not exist on the input side (treated as
  * mint) || input total == output total.
+ * A mint may create only one token UTXO (one FTape output) for the same
+ * partial_hash; multiple outputs of a freshly minted token are rejected.
  * Also verifies that all output tape amounts are non-negative.
  */
 TokenCheckResult CheckTokenAmountConservation(const CTransaction& tx,
