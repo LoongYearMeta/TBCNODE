@@ -94,36 +94,21 @@ const std::vector<uint8_t> FTAPE_FLAG = {0x46, 0x54, 0x61, 0x70, 0x65};
 const std::vector<uint8_t> NTAPE_FLAG = {0x4e, 0x54, 0x61, 0x70, 0x65};
 
 /**
- * poolnft tape layout (matches getPoolNftTape in the tbc-contract SDK):
- *   OP_FALSE OP_RETURN <64B ft_lp/ft_a partialhash>
- *   <24B amount: ft_lp_amount/ft_a_amount/tbc_amount, 8 bytes LE each>
- *   <32B ft_a_contractTxid> <serviceFeeRate> <lpPlan> <withLock> <withLockTime>
- *   "NTape"
- * The amount is the 4th chunk (the pool contract script slices the same
- * 3x8B amounts at offset 0x44).
+ * poolnft tape layout (matches getPoolNftTape in the tbc-contract SDK),
+ * expressed as raw script bytes with fixed offsets:
+ *   [0]    0x00  OP_FALSE
+ *   [1]    0x6a  OP_RETURN
+ *   [2]    0x40  push 64 bytes
+ *   [3]    64B ft_lp/ft_a partialhash
+ *   [0x43] 0x18  push 24 bytes
+ *   [0x44] 24B amount: ft_lp_amount/ft_a_amount/tbc_amount, 8 bytes LE each
+ *   ...    <32B ft_a_contractTxid> <serviceFeeRate> <lpPlan> ... "NTape"
+ * The pool contract script slices the same 3x8B amounts at offset 0x44.
  */
-constexpr size_t POOLNFT_AMOUNT_CHUNK_INDEX = 3;
+constexpr size_t POOLNFT_AMOUNT_OFFSET = 0x44;
 constexpr size_t POOLNFT_AMOUNT_SIZE = 24;
-
-struct ScriptChunk {
-    opcodetype opcode{OP_INVALIDOPCODE};
-    std::vector<uint8_t> data;
-};
-
-//! Parse the whole script into an (opcode, data) sequence; returns false for
-//! malformed scripts such as truncated pushes.
-bool ParseScriptChunks(const CScript& script, std::vector<ScriptChunk>& chunks) {
-    chunks.clear();
-    CScript::const_iterator pc = script.begin();
-    while (pc < script.end()) {
-        ScriptChunk chunk;
-        if (!script.GetOp(pc, chunk.opcode, chunk.data)) {
-            return false;
-        }
-        chunks.push_back(std::move(chunk));
-    }
-    return true;
-}
+constexpr uint8_t POOLNFT_HASH_PUSH_OPCODE = 0x40;   // push 64 bytes
+constexpr uint8_t POOLNFT_AMOUNT_PUSH_OPCODE = 0x18; // push 24 bytes
 
 //! Match raw script bytes of the form `OP_FALSE OP_RETURN ... <flag>`.
 //! The flag only needs to be a suffix of the complete script; it does not
@@ -152,53 +137,37 @@ bool MatchesFTapePattern(const CScript& lockingScript) {
 
 /**
  * Determine whether a script has the poolnft tape layout (as opposed to
- * another tape sharing the same flag). A poolnft tape has at least 6 chunks:
- * OP_FALSE OP_RETURN <64B hash> <24B amount> <32B txid> "NTape"; later
- * versions carry extra fields (fee rate etc.) after the txid.
+ * another tape sharing the same flag), by raw byte inspection: starts with
+ * `OP_FALSE OP_RETURN`, ends with "NTape", carries a 64-byte push at offset 2
+ * and a 24-byte amount push at offset 0x43 (amount data at 0x44).
  */
 bool IsPoolNftTapeLayout(const CScript& lockingScript) {
-    std::vector<ScriptChunk> chunks;
-    if (!MatchesNTapePattern(lockingScript) ||
-        !ParseScriptChunks(lockingScript, chunks) || chunks.size() < 6) {
+    if (!MatchesNTapePattern(lockingScript)) {
         return false;
     }
-    // chunk[2]=ft_lp||ft_a partialhash(64B), chunk[3]=3x uint64 amount(24B)
-    return chunks[2].data.size() == 64 &&
-           chunks[3].data.size() == POOLNFT_AMOUNT_SIZE;
+    // The trailing "NTape" flag must live after the amount field.
+    if (lockingScript.size() <
+        POOLNFT_AMOUNT_OFFSET + POOLNFT_AMOUNT_SIZE + NTAPE_FLAG.size()) {
+        return false;
+    }
+    return lockingScript[2] == POOLNFT_HASH_PUSH_OPCODE &&
+           lockingScript[POOLNFT_AMOUNT_OFFSET - 1] ==
+               POOLNFT_AMOUNT_PUSH_OPCODE;
 }
 
-//! New and old poolnft tapes must match chunk by chunk, except for the
-//! amount field (4th chunk).
+//! New and old poolnft tapes are compared as raw bytes: same length, and
+//! identical everywhere except the 24-byte amount field at offset 0x44.
 bool PoolNftTapesMatchExceptAmount(const CScript& newTape,
                                    const CScript& oldTape) {
-    std::vector<ScriptChunk> newChunks;
-    std::vector<ScriptChunk> oldChunks;
-    if (!ParseScriptChunks(newTape, newChunks) ||
-        !ParseScriptChunks(oldTape, oldChunks)) {
+    if (newTape.size() != oldTape.size() ||
+        newTape.size() < POOLNFT_AMOUNT_OFFSET + POOLNFT_AMOUNT_SIZE) {
         return false;
     }
-    if (newChunks.size() != oldChunks.size() ||
-        newChunks.size() <= POOLNFT_AMOUNT_CHUNK_INDEX) {
-        return false;
-    }
-    for (size_t i = 0; i < newChunks.size(); ++i) {
-        if (newChunks[i].opcode != oldChunks[i].opcode) {
-            return false;
-        }
-        if (i == POOLNFT_AMOUNT_CHUNK_INDEX) {
-            // The amount field may change, but both sides must be 24 bytes
-            // (3 uint64 values).
-            if (newChunks[i].data.size() != POOLNFT_AMOUNT_SIZE ||
-                oldChunks[i].data.size() != POOLNFT_AMOUNT_SIZE) {
-                return false;
-            }
-            continue;
-        }
-        if (newChunks[i].data != oldChunks[i].data) {
-            return false;
-        }
-    }
-    return true;
+    constexpr size_t amountEnd = POOLNFT_AMOUNT_OFFSET + POOLNFT_AMOUNT_SIZE;
+    return std::equal(newTape.begin(), newTape.begin() + POOLNFT_AMOUNT_OFFSET,
+                      oldTape.begin()) &&
+           std::equal(newTape.begin() + amountEnd, newTape.end(),
+                      oldTape.begin() + amountEnd);
 }
 
 } // namespace

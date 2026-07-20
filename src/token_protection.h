@@ -10,7 +10,6 @@
 
 #include <cstdint>
 #include <functional>
-#include <map>
 #include <optional>
 #include <vector>
 
@@ -90,9 +89,9 @@ TokenCheckResult CheckTokenAmountConservation(const CTransaction& tx,
  * PoolNFT tape tamper check:
  * if vout[1] is an NTape with poolnft layout, fetch the old tape at vout[1]
  * of the previous transaction referenced by vin[0], and require the new and
- * old tapes to be identical except for the amount field (4th chunk, 24B).
- * Pool creation (no poolnft tape in the previous transaction) is treated as
- * mint and passes.
+ * old tapes to be byte-identical except for the 24-byte amount field at raw
+ * script offset 0x44. Pool creation (no poolnft tape in the previous
+ * transaction) is treated as mint and passes.
  */
 TokenCheckResult CheckPoolNftTape(const CTransaction& tx,
                                   const PrevTxFetcher& prevTxFetcher);
