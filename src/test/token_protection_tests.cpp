@@ -35,6 +35,8 @@ namespace {
 
 const std::vector<uint8_t> FTAPE_FLAG = {0x46, 0x54, 0x61, 0x70, 0x65};
 const std::vector<uint8_t> NTAPE_FLAG = {0x4e, 0x54, 0x61, 0x70, 0x65};
+//! "2Code" contract code marker (hex 32436f6465)
+const std::vector<uint8_t> CODE_MARKER = {0x32, 0x43, 0x6f, 0x64, 0x65};
 
 std::vector<uint8_t> EncodeLE64Slots(const std::vector<int64_t>& values) {
     std::vector<uint8_t> data(values.size() * 8, 0);
@@ -86,6 +88,12 @@ CScript MakeContractScript(uint8_t tag) {
                      << OP_TRUE;
 }
 
+//! Pool contract locking script: raw bytes end with the "2Code" marker.
+CScript MakePoolContractScript(uint8_t tag = 0x01) {
+    return CScript() << std::vector<uint8_t>{tag, tag, tag} << OP_DROP
+                     << OP_TRUE << CODE_MARKER;
+}
+
 CTransactionRef MakePrevTxWithFTape(const CScript& contractScript,
                                     std::array<int64_t, 6> amounts) {
     CMutableTransaction prev;
@@ -112,7 +120,7 @@ CTransactionRef MakePrevTxWithPoolNftTape(
     prev.vin[0].scriptSig = CScript() << OP_0;
     prev.vout.resize(2);
     prev.vout[0].nValue = Amount(1);
-    prev.vout[0].scriptPubKey = MakeContractScript(0x01);
+    prev.vout[0].scriptPubKey = MakePoolContractScript();
     prev.vout[1].nValue = Amount(0);
     prev.vout[1].scriptPubKey =
         MakePoolNftTapeScript(amounts, hashPrefix, flagPrefix);
@@ -131,6 +139,14 @@ PrevTxFetcher MakeFetcher(const std::map<TxId, CTransactionRef>& prevById) {
 
 CScript GetP2PK(const CKey& key) {
     return CScript() << ToByteVector(key.GetPubKey()) << OP_CHECKSIG;
+}
+
+//! Spendable script whose raw bytes end with the "2Code" marker: the
+//! trailing push leaves a truthy element on the stack after the
+//! signature check.
+CScript GetP2PKWithCodeMarker(const CKey& key) {
+    return CScript() << ToByteVector(key.GetPubKey()) << OP_CHECKSIGVERIFY
+                     << CODE_MARKER;
 }
 
 void SignP2PKInput(CMutableTransaction& tx, size_t inputIndex,
@@ -429,6 +445,7 @@ BOOST_AUTO_TEST_CASE(poolnft_tape_tamper_checks) {
         suffixTx.vin.resize(1);
         suffixTx.vin[0].prevout = COutPoint(suffixPrev->GetId(), 0);
         suffixTx.vout.resize(2);
+        suffixTx.vout[0].scriptPubKey = MakePoolContractScript();
         suffixTx.vout[1].scriptPubKey = MakePoolNftTapeScript(
             oldAmounts, {/*hashPrefix*/ {0x99}}, flagPrefix);
         BOOST_CHECK(CheckPoolNftTape(CTransaction(suffixTx), suffixFetcher) ==
@@ -454,7 +471,7 @@ BOOST_AUTO_TEST_CASE(poolnft_tape_tamper_checks) {
         tx.vin.resize(1);
         tx.vin[0].prevout = COutPoint(prevTx->GetId(), 0);
         tx.vout.resize(2);
-        tx.vout[0].scriptPubKey = MakeContractScript(0x01);
+        tx.vout[0].scriptPubKey = MakePoolContractScript();
         tx.vout[1].scriptPubKey =
             MakePoolNftTapeScript({11, 22, 33}, {/*hashPrefix*/ {0x01}});
         BOOST_CHECK(CheckPoolNftTape(CTransaction(tx), fetcher) ==
@@ -467,11 +484,25 @@ BOOST_AUTO_TEST_CASE(poolnft_tape_tamper_checks) {
         tx.vin.resize(1);
         tx.vin[0].prevout = COutPoint(prevTx->GetId(), 0);
         tx.vout.resize(2);
-        tx.vout[0].scriptPubKey = MakeContractScript(0x01);
+        tx.vout[0].scriptPubKey = MakePoolContractScript();
         tx.vout[1].scriptPubKey =
             MakePoolNftTapeScript(oldAmounts, {/*hashPrefix*/ {0x99}});
         BOOST_CHECK(CheckPoolNftTape(CTransaction(tx), fetcher) ==
                     TokenCheckResult::POOLNFT_TAPE_TAMPERED);
+    }
+
+    // vout[1] has a poolnft tape layout, but vout[0] does not end with the
+    // "2Code" marker -> not recognized as poolnft, check skipped
+    {
+        CMutableTransaction tx;
+        tx.vin.resize(1);
+        tx.vin[0].prevout = COutPoint(prevTx->GetId(), 0);
+        tx.vout.resize(2);
+        tx.vout[0].scriptPubKey = MakeContractScript(0x01);
+        tx.vout[1].scriptPubKey =
+            MakePoolNftTapeScript(oldAmounts, {/*hashPrefix*/ {0x99}});
+        BOOST_CHECK(CheckPoolNftTape(CTransaction(tx), fetcher) ==
+                    TokenCheckResult::OK);
     }
 
     // Previous transaction unavailable
@@ -480,6 +511,7 @@ BOOST_AUTO_TEST_CASE(poolnft_tape_tamper_checks) {
         tx.vin.resize(1);
         tx.vin[0].prevout = COutPoint(uint256S("0xbeef"), 0);
         tx.vout.resize(2);
+        tx.vout[0].scriptPubKey = MakePoolContractScript();
         tx.vout[1].scriptPubKey = MakePoolNftTapeScript(oldAmounts);
         BOOST_CHECK(CheckPoolNftTape(CTransaction(tx), MakeFetcher({})) ==
                     TokenCheckResult::PREV_TX_UNAVAILABLE);
@@ -498,6 +530,7 @@ BOOST_AUTO_TEST_CASE(poolnft_tape_tamper_checks) {
         tx.vin.resize(1);
         tx.vin[0].prevout = COutPoint(fundingRef->GetId(), 0);
         tx.vout.resize(2);
+        tx.vout[0].scriptPubKey = MakePoolContractScript();
         tx.vout[1].scriptPubKey = MakePoolNftTapeScript(oldAmounts);
         BOOST_CHECK(CheckPoolNftTape(
                         CTransaction(tx),
@@ -709,7 +742,9 @@ BOOST_AUTO_TEST_CASE(txnvalidation_rejects_poolnft_tape_tampered) {
     GlobalConfig& config = GlobalConfig::GetConfig();
     config.SetTokenProtectionEnabled(true);
 
-    const CScript contract = GetP2PK(coinbaseKey);
+    // Pool contract at vout[0] must end with the "2Code" marker for the
+    // transaction to be recognized as poolnft.
+    const CScript contract = GetP2PKWithCodeMarker(coinbaseKey);
     const auto amounts = std::array<int64_t, 3>{10, 20, 30};
     const std::vector<uint8_t> hashOk{0x01};
     const std::vector<uint8_t> hashTampered{0x99};

@@ -98,6 +98,16 @@ bool GetTapeDataAfterOpReturn(const CScript& script,
 const std::vector<uint8_t> FTAPE_FLAG = {0x46, 0x54, 0x61, 0x70, 0x65};
 //! poolnft tape flag: "NTape" (hex 4e54617065)
 const std::vector<uint8_t> NTAPE_FLAG = {0x4e, 0x54, 0x61, 0x70, 0x65};
+//! Contract code marker: "2Code" (hex 32436f6465); pool contract locking
+//! scripts (vout[0]) end with this marker.
+const std::vector<uint8_t> CODE_MARKER = {0x32, 0x43, 0x6f, 0x64, 0x65};
+
+//! Whether the raw script bytes end with the "2Code" marker.
+bool HasCodeMarkerSuffix(const CScript& script) {
+    return script.size() >= CODE_MARKER.size() &&
+           std::equal(CODE_MARKER.begin(), CODE_MARKER.end(),
+                      script.end() - CODE_MARKER.size());
+}
 
 /**
  * poolnft tape layout (matches getPoolNftTape in the tbc-contract SDK),
@@ -312,11 +322,13 @@ TokenCheckResult CheckTokenAmountConservation(const CTransaction& tx,
 
 TokenCheckResult CheckPoolNftTape(const CTransaction& tx,
                                   const PrevTxFetcher& prevTxFetcher) {
-    // Only run the check when vout[1] is an NTape with poolnft layout.
-    // Other tapes may share the "NTape" flag but have a different chunk
-    // layout; they must be excluded to avoid false rejections.
+    // Only run the check when vout[1] is an NTape with poolnft layout and
+    // vout[0] (the pool contract) ends with the "2Code" marker. Other tapes
+    // may share the "NTape" flag but have a different layout; they must be
+    // excluded to avoid false rejections.
     if (tx.vout.size() < 2 ||
-        !IsPoolNftTapeLayout(tx.vout[1].scriptPubKey)) {
+        !IsPoolNftTapeLayout(tx.vout[1].scriptPubKey) ||
+        !HasCodeMarkerSuffix(tx.vout[0].scriptPubKey)) {
         return TokenCheckResult::OK;
     }
     if (tx.vin.empty()) {
@@ -335,10 +347,12 @@ TokenCheckResult CheckPoolNftTape(const CTransaction& tx,
 
     // createPoolNFT: the previous transaction is usually a funding
     // transaction that may lack vout[1], or whose vout[1] is change or not a
-    // poolnft tape -- treat it as minting a new pool and skip the tamper
-    // comparison.
+    // poolnft tape (same recognition: poolnft tape layout at vout[1] plus
+    // "2Code"-suffixed contract at vout[0]) -- treat it as minting a new
+    // pool and skip the tamper comparison.
     if (prevTx->vout.size() < 2 ||
-        !IsPoolNftTapeLayout(prevTx->vout[1].scriptPubKey)) {
+        !IsPoolNftTapeLayout(prevTx->vout[1].scriptPubKey) ||
+        !HasCodeMarkerSuffix(prevTx->vout[0].scriptPubKey)) {
         return TokenCheckResult::OK;
     }
 
