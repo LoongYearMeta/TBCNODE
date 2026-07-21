@@ -30,12 +30,21 @@ bool SafeAddNonNegative(int64_t& acc, int64_t value) {
 }
 
 /**
+ * Fixed-length suffix at the end of a contract script:
+ *   OP_RETURN(1) + push21(1+21) + push5(1+5) = 29 bytes.
+ * The suffix content (e.g. code hash / "2Code") may vary, but its serialized
+ * length is fixed.
+ */
+constexpr size_t CONTRACT_SCRIPT_SUFFIX_LEN = 29;
+
+/**
  * If sourceTx.vout[tapeIndex] is an FTape output, parse its amounts and
  * accumulate them into the map keyed by token identity (partial hash of the
  * contract output right before the tape). A tape output immediately follows
- * its contract output, so a tape at index 0 has no contract to attribute to
- * and is excluded from conservation accounting (non-negative amounts are
- * still verified).
+ * its contract output; a tape at index 0 has no contract to attribute to,
+ * and a preceding script no longer than the fixed contract suffix cannot be
+ * a token contract. Both cases are excluded from conservation accounting
+ * (non-negative amounts are still verified).
  */
 TokenCheckResult AccumulateTapeAmount(const CTransaction& sourceTx,
                                       size_t tapeIndex, TokenAmountMap& map,
@@ -51,8 +60,11 @@ TokenCheckResult AccumulateTapeAmount(const CTransaction& sourceTx,
     if (tapeIndex == 0) {
         return TokenCheckResult::OK;
     }
-    const uint256 tokenId =
-        ComputeTokenPartialHash(sourceTx.vout[tapeIndex - 1].scriptPubKey);
+    const CScript& contractScript = sourceTx.vout[tapeIndex - 1].scriptPubKey;
+    if (contractScript.size() <= CONTRACT_SCRIPT_SUFFIX_LEN) {
+        return TokenCheckResult::OK;
+    }
+    const uint256 tokenId = ComputeTokenPartialHash(contractScript);
     if (countMap) {
         ++(*countMap)[tokenId];
     }
@@ -123,52 +135,27 @@ bool HasCodeMarkerSuffix(const CScript& script) {
  */
 constexpr size_t POOLNFT_AMOUNT_OFFSET = 0x44;
 constexpr size_t POOLNFT_AMOUNT_SIZE = 24;
-constexpr uint8_t POOLNFT_HASH_PUSH_OPCODE = 0x40;   // push 64 bytes
-constexpr uint8_t POOLNFT_AMOUNT_PUSH_OPCODE = 0x18; // push 24 bytes
 
-//! Match raw script bytes of the form `OP_FALSE OP_RETURN ... <flag>`.
-//! The flag only needs to be a suffix of the complete script; it does not
-//! need to occupy a standalone push-data chunk.
+//! Match raw script bytes ending with `<flag>`. The flag only needs to be a
+//! suffix of the complete script; it does not need to occupy a standalone
+//! push-data chunk.
 bool MatchesTapeFlagPattern(const CScript& lockingScript,
                             const std::vector<uint8_t>& flag) {
-    if (lockingScript.size() < 2 + flag.size()) {
+    if (lockingScript.size() < flag.size()) {
         return false;
     }
-    const auto flagBegin =
-        lockingScript.begin() + (lockingScript.size() - flag.size());
-    return lockingScript[0] == OP_FALSE && lockingScript[1] == OP_RETURN &&
-           std::equal(flag.begin(), flag.end(), flagBegin);
+    return std::equal(flag.begin(), flag.end(),
+                      lockingScript.end() - flag.size());
 }
 
-//! Match tape outputs of the form `OP_FALSE OP_RETURN ... "NTape"`.
+//! Match tape outputs ending with "NTape".
 bool MatchesNTapePattern(const CScript& lockingScript) {
     return MatchesTapeFlagPattern(lockingScript, NTAPE_FLAG);
 }
 
-//! Match FT/LP/StableCoin tape outputs of the form
-//! `OP_FALSE OP_RETURN ... "FTape"`.
+//! Match FT/LP/StableCoin tape outputs ending with "FTape".
 bool MatchesFTapePattern(const CScript& lockingScript) {
     return MatchesTapeFlagPattern(lockingScript, FTAPE_FLAG);
-}
-
-/**
- * Determine whether a script has the poolnft tape layout (as opposed to
- * another tape sharing the same flag), by raw byte inspection: starts with
- * `OP_FALSE OP_RETURN`, ends with "NTape", carries a 64-byte push at offset 2
- * and a 24-byte amount push at offset 0x43 (amount data at 0x44).
- */
-bool IsPoolNftTapeLayout(const CScript& lockingScript) {
-    if (!MatchesNTapePattern(lockingScript)) {
-        return false;
-    }
-    // The trailing "NTape" flag must live after the amount field.
-    if (lockingScript.size() <
-        POOLNFT_AMOUNT_OFFSET + POOLNFT_AMOUNT_SIZE + NTAPE_FLAG.size()) {
-        return false;
-    }
-    return lockingScript[2] == POOLNFT_HASH_PUSH_OPCODE &&
-           lockingScript[POOLNFT_AMOUNT_OFFSET - 1] ==
-               POOLNFT_AMOUNT_PUSH_OPCODE;
 }
 
 //! New and old poolnft tapes are compared as raw bytes: same length, and
@@ -235,14 +222,6 @@ std::optional<std::vector<int64_t>> ParseTapeAmounts(const CScript& tapeScript) 
     }
     return amounts;
 }
-
-/**
- * Fixed-length suffix at the end of a contract script:
- *   OP_RETURN(1) + push21(1+21) + push5(1+5) = 29 bytes.
- * The suffix content (e.g. code hash / "2Code") may vary, but its serialized
- * length is fixed.
- */
-constexpr size_t CONTRACT_SCRIPT_SUFFIX_LEN = 29;
 
 uint256 ComputeTokenPartialHash(const CScript& lockingScript) {
     const size_t digestLen = lockingScript.size() > CONTRACT_SCRIPT_SUFFIX_LEN
@@ -322,12 +301,10 @@ TokenCheckResult CheckTokenAmountConservation(const CTransaction& tx,
 
 TokenCheckResult CheckPoolNftTape(const CTransaction& tx,
                                   const PrevTxFetcher& prevTxFetcher) {
-    // Only run the check when vout[1] is an NTape with poolnft layout and
-    // vout[0] (the pool contract) ends with the "2Code" marker. Other tapes
-    // may share the "NTape" flag but have a different layout; they must be
-    // excluded to avoid false rejections.
+    // Only run the check when vout[1] ends with the "NTape" flag and
+    // vout[0] (the pool contract) ends with the "2Code" marker.
     if (tx.vout.size() < 2 ||
-        !IsPoolNftTapeLayout(tx.vout[1].scriptPubKey) ||
+        !MatchesNTapePattern(tx.vout[1].scriptPubKey) ||
         !HasCodeMarkerSuffix(tx.vout[0].scriptPubKey)) {
         return TokenCheckResult::OK;
     }
@@ -347,11 +324,11 @@ TokenCheckResult CheckPoolNftTape(const CTransaction& tx,
 
     // createPoolNFT: the previous transaction is usually a funding
     // transaction that may lack vout[1], or whose vout[1] is change or not a
-    // poolnft tape (same recognition: poolnft tape layout at vout[1] plus
+    // poolnft tape (same recognition: "NTape"-suffixed vout[1] plus
     // "2Code"-suffixed contract at vout[0]) -- treat it as minting a new
     // pool and skip the tamper comparison.
     if (prevTx->vout.size() < 2 ||
-        !IsPoolNftTapeLayout(prevTx->vout[1].scriptPubKey) ||
+        !MatchesNTapePattern(prevTx->vout[1].scriptPubKey) ||
         !HasCodeMarkerSuffix(prevTx->vout[0].scriptPubKey)) {
         return TokenCheckResult::OK;
     }

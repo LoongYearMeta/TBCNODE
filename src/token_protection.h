@@ -47,15 +47,15 @@ const char* TokenCheckResultToRejectReason(TokenCheckResult result);
 
 /**
  * Whether the output locking script is an FT/LP/StableCoin tape output:
- * raw script starts with `OP_FALSE OP_RETURN` and ends with
- * `4654617065` ("FTape" flag). The flag need not be a standalone chunk.
+ * raw script ends with `4654617065` ("FTape" flag). The flag need not be
+ * a standalone chunk.
  */
 bool IsFTapeOutput(const CScript& lockingScript);
 
 /**
  * Whether the output locking script is a PoolNFT tape output:
- * raw script starts with `OP_FALSE OP_RETURN` and ends with
- * `4e54617065` ("NTape" flag). The flag need not be a standalone chunk.
+ * raw script ends with `4e54617065` ("NTape" flag). The flag need not be
+ * a standalone chunk.
  */
 bool IsNTapeOutput(const CScript& lockingScript);
 

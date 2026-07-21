@@ -83,9 +83,10 @@ CScript MakeNonPoolNftNTapeScript() {
                      << std::vector<uint8_t>{'{', '}'} << NTAPE_FLAG;
 }
 
+//! Contract locking script longer than the fixed 29-byte suffix, so its tape
+//! is counted by the conservation check.
 CScript MakeContractScript(uint8_t tag) {
-    return CScript() << std::vector<uint8_t>{tag, tag, tag} << OP_DROP
-                     << OP_TRUE;
+    return CScript() << std::vector<uint8_t>(30, tag) << OP_DROP << OP_TRUE;
 }
 
 //! Pool contract locking script: raw bytes end with the "2Code" marker.
@@ -209,12 +210,21 @@ BOOST_AUTO_TEST_CASE(ftape_ntape_pattern_match) {
     const CScript realFtape(realFtapeHex.begin(), realFtapeHex.end());
     BOOST_CHECK(IsFTapeOutput(realFtape));
 
-    // Missing flag / prefix is not OP_FALSE OP_RETURN
+    // Missing flag
     BOOST_CHECK(!IsFTapeOutput(CScript() << OP_FALSE << OP_RETURN
                                          << MakeFTapeAmountField({1, 0, 0, 0, 0, 0})));
-    BOOST_CHECK(!IsFTapeOutput(CScript() << OP_1 << OP_RETURN
-                                         << MakeFTapeAmountField({1, 0, 0, 0, 0, 0})
-                                         << FTAPE_FLAG));
+
+    // Recognition is suffix-only: the script does not need to start with
+    // OP_FALSE OP_RETURN to be recognized as a tape.
+    BOOST_CHECK(IsFTapeOutput(CScript() << OP_1 << OP_RETURN
+                                        << MakeFTapeAmountField({1, 0, 0, 0, 0, 0})
+                                        << FTAPE_FLAG));
+    BOOST_CHECK(IsNTapeOutput(CScript() << std::vector<uint8_t>{0x01}
+                                        << NTAPE_FLAG));
+
+    // Script shorter than the flag itself
+    BOOST_CHECK(!IsFTapeOutput(CScript()));
+    BOOST_CHECK(!IsFTapeOutput(CScript() << OP_TRUE));
 }
 
 BOOST_AUTO_TEST_CASE(parse_tape_amounts_non_negative_and_boundaries) {
@@ -427,6 +437,91 @@ BOOST_AUTO_TEST_CASE(amount_conservation_mint_and_transfer) {
     }
 }
 
+BOOST_AUTO_TEST_CASE(tape_excluded_without_valid_contract) {
+    // FTape at index 0 has no preceding contract -> not a token output; no
+    // conservation constraint, so the (unfetchable) input is never needed.
+    {
+        CMutableTransaction tx;
+        tx.vin.resize(1);
+        tx.vin[0].prevout = COutPoint(uint256S("0xdead"), 0);
+        tx.vout.resize(1);
+        tx.vout[0].scriptPubKey = MakeFTapeScript({50, 0, 0, 0, 0, 0});
+        BOOST_CHECK(CheckTokenAmountConservation(CTransaction(tx),
+                                                 MakeFetcher({})) ==
+                    TokenCheckResult::OK);
+    }
+
+    // A preceding script no longer than the fixed 29-byte contract suffix
+    // cannot be a token contract -> the tape is excluded as well.
+    const CScript shortScript =
+        CScript() << std::vector<uint8_t>(27, 0xaa) << OP_TRUE;
+    BOOST_REQUIRE_EQUAL(shortScript.size(), 29U);
+    {
+        CMutableTransaction tx;
+        tx.vin.resize(1);
+        tx.vin[0].prevout = COutPoint(uint256S("0xdead"), 0);
+        tx.vout.resize(2);
+        tx.vout[0].scriptPubKey = shortScript;
+        tx.vout[1].scriptPubKey = MakeFTapeScript({50, 0, 0, 0, 0, 0});
+        BOOST_CHECK(CheckTokenAmountConservation(CTransaction(tx),
+                                                 MakeFetcher({})) ==
+                    TokenCheckResult::OK);
+
+        // Boundary: 30 bytes (> suffix length) is a valid contract -> the
+        // tape counts and the missing previous transaction is reported.
+        const CScript minContract =
+            CScript() << std::vector<uint8_t>(28, 0xaa) << OP_TRUE;
+        BOOST_REQUIRE_EQUAL(minContract.size(), 30U);
+        tx.vout[0].scriptPubKey = minContract;
+        BOOST_CHECK(CheckTokenAmountConservation(CTransaction(tx),
+                                                 MakeFetcher({})) ==
+                    TokenCheckResult::PREV_TX_UNAVAILABLE);
+    }
+
+    // Excluded tapes still have their amounts verified as non-negative.
+    {
+        CMutableTransaction tx;
+        tx.vout.resize(2);
+        tx.vout[0].scriptPubKey = shortScript;
+        tx.vout[1].scriptPubKey = MakeFTapeScript({-1, 0, 0, 0, 0, 0});
+        BOOST_CHECK(CheckTokenAmountConservation(CTransaction(tx),
+                                                 MakeFetcher({})) ==
+                    TokenCheckResult::NEGATIVE_AMOUNT);
+    }
+
+    // Input side: a tape behind a short contract is not counted either. The
+    // output contract below is shortScript + a 29-byte suffix, so its
+    // partial hash equals SHA256(shortScript) -- the same value the input
+    // would map to if it were counted. With the exclusion the output token
+    // is treated as a mint (OK); without it this would be an
+    // AMOUNT_MISMATCH (100 != 60).
+    {
+        CMutableTransaction prev;
+        prev.vout.resize(2);
+        prev.vout[0].scriptPubKey = shortScript;
+        prev.vout[1].scriptPubKey = MakeFTapeScript({100, 0, 0, 0, 0, 0});
+        const auto prevRef = MakeTransactionRef(prev);
+
+        const CScript outputContract =
+            CScript(shortScript)
+            << OP_RETURN << std::vector<uint8_t>(21, 0xc3) << CODE_MARKER;
+        BOOST_REQUIRE_EQUAL(outputContract.size(), shortScript.size() + 29U);
+        BOOST_REQUIRE(ComputeTokenPartialHash(outputContract) ==
+                      ComputeTokenPartialHash(shortScript));
+
+        CMutableTransaction tx;
+        tx.vin.resize(1);
+        tx.vin[0].prevout = COutPoint(prevRef->GetId(), 0);
+        tx.vout.resize(2);
+        tx.vout[0].scriptPubKey = outputContract;
+        tx.vout[1].scriptPubKey = MakeFTapeScript({60, 0, 0, 0, 0, 0});
+        BOOST_CHECK(CheckTokenAmountConservation(
+                        CTransaction(tx),
+                        MakeFetcher({{prevRef->GetId(), prevRef}})) ==
+                    TokenCheckResult::OK);
+    }
+}
+
 BOOST_AUTO_TEST_CASE(poolnft_tape_tamper_checks) {
     const auto oldAmounts = std::array<int64_t, 3>{10, 20, 30};
     const auto prevTx =
@@ -452,7 +547,8 @@ BOOST_AUTO_TEST_CASE(poolnft_tape_tamper_checks) {
                     TokenCheckResult::POOLNFT_TAPE_TAMPERED);
     }
 
-    // Not a poolnft layout (plain NTape / FTape) -> skipped
+    // vout[1] without the "NTape" suffix (e.g. FTape), or vout[1] with the
+    // suffix but vout[0] without the "2Code" marker -> skipped
     {
         CMutableTransaction tx;
         tx.vout.resize(2);
@@ -460,9 +556,25 @@ BOOST_AUTO_TEST_CASE(poolnft_tape_tamper_checks) {
         BOOST_CHECK(CheckPoolNftTape(CTransaction(tx), fetcher) ==
                     TokenCheckResult::OK);
 
+        // vout[0] is empty here, so the plain NTape is not recognized.
         tx.vout[1].scriptPubKey = MakeNonPoolNftNTapeScript();
         BOOST_CHECK(CheckPoolNftTape(CTransaction(tx), fetcher) ==
                     TokenCheckResult::OK);
+    }
+
+    // Recognition is suffix-only: any "NTape"-suffixed vout[1] combined with
+    // a "2Code"-suffixed vout[0] enters the check, even without the poolnft
+    // fixed-offset layout. Here the new tape differs from the old poolnft
+    // tape -> tampered.
+    {
+        CMutableTransaction tx;
+        tx.vin.resize(1);
+        tx.vin[0].prevout = COutPoint(prevTx->GetId(), 0);
+        tx.vout.resize(2);
+        tx.vout[0].scriptPubKey = MakePoolContractScript();
+        tx.vout[1].scriptPubKey = MakeNonPoolNftNTapeScript();
+        BOOST_CHECK(CheckPoolNftTape(CTransaction(tx), fetcher) ==
+                    TokenCheckResult::POOLNFT_TAPE_TAMPERED);
     }
 
     // Amount may change while other fields stay the same -> passes
