@@ -189,6 +189,7 @@ BITCOIN_CORE_H = \
   threadinterrupt.h \
   timedata.h \
   time_locked_mempool.h \
+  token_protection.h \
   torcontrol.h \
   txdb.h \
   txmempool.h \
@@ -282,6 +283,7 @@ libbitcoin_server_a_SOURCES = \
   script/ismine.cpp \
   timedata.cpp \
   time_locked_mempool.cpp \
+  token_protection.cpp \
   torcontrol.cpp \
   txdb.cpp \
   txmempool.cpp \

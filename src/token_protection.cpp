@@ -1,0 +1,353 @@
+// Copyright (c) 2026 The TBC developers
+// Distributed under the MIT software license, see the accompanying
+// file COPYING or http://www.opensource.org/licenses/mit-license.php.
+
+#include "token_protection.h"
+
+#include "crypto/common.h"
+#include "crypto/sha256.h"
+
+#include <algorithm>
+#include <limits>
+#include <map>
+
+namespace token_protection {
+
+namespace {
+
+//! Token identity (contract partial_hash) -> amount sum
+using TokenAmountMap = std::map<uint256, int64_t>;
+//! Token identity (contract partial_hash) -> number of tape outputs
+using TokenOutputCountMap = std::map<uint256, size_t>;
+
+//! Accumulate non-negative values; returns false on overflow.
+bool SafeAddNonNegative(int64_t& acc, int64_t value) {
+    if (acc > std::numeric_limits<int64_t>::max() - value) {
+        return false;
+    }
+    acc += value;
+    return true;
+}
+
+/**
+ * Fixed-length suffix at the end of a contract script:
+ *   OP_RETURN(1) + push21(1+21) + push5(1+5) = 29 bytes.
+ * The suffix content (e.g. code hash / "2Code") may vary, but its serialized
+ * length is fixed.
+ */
+constexpr size_t CONTRACT_SCRIPT_SUFFIX_LEN = 29;
+
+/**
+ * If sourceTx.vout[tapeIndex] is an FTape output, parse its amounts and
+ * accumulate them into the map keyed by token identity (partial hash of the
+ * contract output right before the tape). A tape output immediately follows
+ * its contract output; a tape at index 0 has no contract to attribute to,
+ * and a preceding script no longer than the fixed contract suffix cannot be
+ * a token contract. Both cases are excluded from conservation accounting
+ * (non-negative amounts are still verified).
+ */
+TokenCheckResult AccumulateTapeAmount(const CTransaction& sourceTx,
+                                      size_t tapeIndex, TokenAmountMap& map,
+                                      TokenOutputCountMap* countMap = nullptr) {
+    const CScript& tapeScript = sourceTx.vout[tapeIndex].scriptPubKey;
+    if (!IsFTapeOutput(tapeScript)) {
+        return TokenCheckResult::OK;
+    }
+    const auto amounts = ParseTapeAmounts(tapeScript);
+    if (!amounts) {
+        return TokenCheckResult::NEGATIVE_AMOUNT;
+    }
+    if (tapeIndex == 0) {
+        return TokenCheckResult::OK;
+    }
+    const CScript& contractScript = sourceTx.vout[tapeIndex - 1].scriptPubKey;
+    if (contractScript.size() <= CONTRACT_SCRIPT_SUFFIX_LEN) {
+        return TokenCheckResult::OK;
+    }
+    const uint256 tokenId = ComputeTokenPartialHash(contractScript);
+    if (countMap) {
+        ++(*countMap)[tokenId];
+    }
+    int64_t& sum = map[tokenId];
+    for (const int64_t amount : *amounts) {
+        if (!SafeAddNonNegative(sum, amount)) {
+            return TokenCheckResult::AMOUNT_MISMATCH;
+        }
+    }
+    return TokenCheckResult::OK;
+}
+
+//! Total size of the tape amount field: 6 slots of 8-byte signed
+//! little-endian integers.
+constexpr size_t TAPE_AMOUNT_FIELD_SIZE = 48;
+constexpr size_t TAPE_AMOUNT_SLOT_SIZE = 8;
+constexpr size_t TAPE_AMOUNT_SLOT_COUNT =
+    TAPE_AMOUNT_FIELD_SIZE / TAPE_AMOUNT_SLOT_SIZE;
+
+/**
+ * Extract the first push data after `OP_FALSE OP_RETURN` (the tape amount
+ * field). Returns false if the script does not match the pattern or the
+ * first element is not a data push.
+ */
+bool GetTapeDataAfterOpReturn(const CScript& script,
+                              std::vector<uint8_t>& data) {
+    CScript::const_iterator pc = script.begin();
+    opcodetype opcode{OP_INVALIDOPCODE};
+    std::vector<uint8_t> vch;
+    if (!script.GetOp(pc, opcode, vch) || opcode != OP_FALSE) {
+        return false;
+    }
+    if (!script.GetOp(pc, opcode, vch) || opcode != OP_RETURN) {
+        return false;
+    }
+    if (!script.GetOp(pc, opcode, data) || opcode > OP_PUSHDATA4) {
+        return false;
+    }
+    return true;
+}
+
+//! FT/LP/StableCoin tape flag: "FTape" (hex 4654617065)
+const std::vector<uint8_t> FTAPE_FLAG = {0x46, 0x54, 0x61, 0x70, 0x65};
+//! poolnft tape flag: "NTape" (hex 4e54617065)
+const std::vector<uint8_t> NTAPE_FLAG = {0x4e, 0x54, 0x61, 0x70, 0x65};
+//! Contract code marker: "2Code" (hex 32436f6465); pool contract locking
+//! scripts (vout[0]) end with this marker.
+const std::vector<uint8_t> CODE_MARKER = {0x32, 0x43, 0x6f, 0x64, 0x65};
+
+//! Whether the raw script bytes end with the "2Code" marker.
+bool HasCodeMarkerSuffix(const CScript& script) {
+    return script.size() >= CODE_MARKER.size() &&
+           std::equal(CODE_MARKER.begin(), CODE_MARKER.end(),
+                      script.end() - CODE_MARKER.size());
+}
+
+/**
+ * poolnft tape layout (matches getPoolNftTape in the tbc-contract SDK),
+ * expressed as raw script bytes with fixed offsets:
+ *   [0]    0x00  OP_FALSE
+ *   [1]    0x6a  OP_RETURN
+ *   [2]    0x40  push 64 bytes
+ *   [3]    64B ft_lp/ft_a partialhash
+ *   [0x43] 0x18  push 24 bytes
+ *   [0x44] 24B amount: ft_lp_amount/ft_a_amount/tbc_amount, 8 bytes LE each
+ *   ...    <32B ft_a_contractTxid> <serviceFeeRate> <lpPlan> ... "NTape"
+ * The pool contract script slices the same 3x8B amounts at offset 0x44.
+ */
+constexpr size_t POOLNFT_AMOUNT_OFFSET = 0x44;
+constexpr size_t POOLNFT_AMOUNT_SIZE = 24;
+
+//! Match raw script bytes ending with `<flag>`. The flag only needs to be a
+//! suffix of the complete script; it does not need to occupy a standalone
+//! push-data chunk.
+bool MatchesTapeFlagPattern(const CScript& lockingScript,
+                            const std::vector<uint8_t>& flag) {
+    if (lockingScript.size() < flag.size()) {
+        return false;
+    }
+    return std::equal(flag.begin(), flag.end(),
+                      lockingScript.end() - flag.size());
+}
+
+//! Match tape outputs ending with "NTape".
+bool MatchesNTapePattern(const CScript& lockingScript) {
+    return MatchesTapeFlagPattern(lockingScript, NTAPE_FLAG);
+}
+
+//! Match FT/LP/StableCoin tape outputs ending with "FTape".
+bool MatchesFTapePattern(const CScript& lockingScript) {
+    return MatchesTapeFlagPattern(lockingScript, FTAPE_FLAG);
+}
+
+//! New and old poolnft tapes are compared as raw bytes: same length, and
+//! identical everywhere except the 24-byte amount field at offset 0x44.
+bool PoolNftTapesMatchExceptAmount(const CScript& newTape,
+                                   const CScript& oldTape) {
+    if (newTape.size() != oldTape.size() ||
+        newTape.size() < POOLNFT_AMOUNT_OFFSET + POOLNFT_AMOUNT_SIZE) {
+        return false;
+    }
+    constexpr size_t amountEnd = POOLNFT_AMOUNT_OFFSET + POOLNFT_AMOUNT_SIZE;
+    return std::equal(newTape.begin(), newTape.begin() + POOLNFT_AMOUNT_OFFSET,
+                      oldTape.begin()) &&
+           std::equal(newTape.begin() + amountEnd, newTape.end(),
+                      oldTape.begin() + amountEnd);
+}
+
+} // namespace
+
+const char* TokenCheckResultToRejectReason(TokenCheckResult result) {
+    switch (result) {
+        case TokenCheckResult::OK:
+            return "";
+        case TokenCheckResult::NEGATIVE_AMOUNT:
+        case TokenCheckResult::AMOUNT_MISMATCH:
+            return "bad-txn-token-amount-mismatch";
+        case TokenCheckResult::MINT_MULTIPLE_OUTPUTS:
+            return "bad-txn-token-mint-multiple-outputs";
+        case TokenCheckResult::POOLNFT_TAPE_TAMPERED:
+            return "bad-txn-poolnft-tape-tampered";
+        case TokenCheckResult::PREV_TX_UNAVAILABLE:
+            return "bad-txn-token-prev-tx-unavailable";
+    }
+    return "";
+}
+
+bool IsFTapeOutput(const CScript& lockingScript) {
+    return MatchesFTapePattern(lockingScript);
+}
+
+bool IsNTapeOutput(const CScript& lockingScript) {
+    return MatchesNTapePattern(lockingScript);
+}
+
+std::optional<std::vector<int64_t>> ParseTapeAmounts(const CScript& tapeScript) {
+    std::vector<uint8_t> data;
+    if (!GetTapeDataAfterOpReturn(tapeScript, data)) {
+        return std::nullopt;
+    }
+    if (data.size() < TAPE_AMOUNT_FIELD_SIZE) {
+        return std::nullopt;
+    }
+
+    std::vector<int64_t> amounts;
+    amounts.reserve(TAPE_AMOUNT_SLOT_COUNT);
+    for (size_t offset = 0; offset < TAPE_AMOUNT_FIELD_SIZE;
+         offset += TAPE_AMOUNT_SLOT_SIZE) {
+        const auto amount =
+            static_cast<int64_t>(ReadLE64(data.data() + offset));
+        if (amount < 0) {
+            return std::nullopt;
+        }
+        amounts.push_back(amount);
+    }
+    return amounts;
+}
+
+uint256 ComputeTokenPartialHash(const CScript& lockingScript) {
+    const size_t digestLen = lockingScript.size() > CONTRACT_SCRIPT_SUFFIX_LEN
+                                 ? lockingScript.size() - CONTRACT_SCRIPT_SUFFIX_LEN
+                                 : lockingScript.size();
+    uint256 hash;
+    CSHA256()
+        .Write(lockingScript.data(), digestLen)
+        .Finalize(hash.begin());
+    return hash;
+}
+
+TokenCheckResult CheckTokenAmountConservation(const CTransaction& tx,
+                                              const PrevTxFetcher& prevTxFetcher) {
+    // Output side: parse all FTape outputs, verify amounts are non-negative
+    // and build the OutputTokenAmountMap, counting how many token UTXOs
+    // (tape outputs) each partial_hash produces.
+    TokenAmountMap outputMap;
+    TokenOutputCountMap outputCountMap;
+    for (size_t i = 0; i < tx.vout.size(); ++i) {
+        const auto result =
+            AccumulateTapeAmount(tx, i, outputMap, &outputCountMap);
+        if (result != TokenCheckResult::OK) {
+            return result;
+        }
+    }
+    // No token involved in the outputs, so no conservation constraint; skip
+    // input-side parsing.
+    if (outputMap.empty()) {
+        return TokenCheckResult::OK;
+    }
+    // Input side: an input spends the contract output at {pre_txid, n}, and
+    // its tape lives at vout[n + 1] of the previous transaction. Tapes are
+    // OP_FALSE OP_RETURN outputs that never enter the UTXO set, so the full
+    // previous transaction is required (mempool -> txindex/disk, injected
+    // via prevTxFetcher).
+    TokenAmountMap inputMap;
+    for (const CTxIn& txin : tx.vin) {
+        const CTransactionRef prevTx =
+            prevTxFetcher(txin.prevout.GetTxId());
+        if (!prevTx) {
+            // Reject when the previous transaction cannot be fetched, so the
+            // check cannot be bypassed by confirming the parent first and
+            // spending it afterwards.
+            return TokenCheckResult::PREV_TX_UNAVAILABLE;
+        }
+        const size_t tapeIndex =
+            static_cast<size_t>(txin.prevout.GetN()) + 1;
+        if (tapeIndex >= prevTx->vout.size()) {
+            continue;
+        }
+        const auto result = AccumulateTapeAmount(*prevTx, tapeIndex, inputMap);
+        if (result != TokenCheckResult::OK) {
+            return result;
+        }
+    }
+
+    // Conservation rule: for each output token, either the token does not
+    // exist on the input side (treated as mint, which covers minttoken /
+    // initpool / adding LP) || input total == output total.
+    for (const auto& [tokenId, outputAmount] : outputMap) {
+        const auto it = inputMap.find(tokenId);
+        if (it == inputMap.end()) {
+            // Mint protection: a freshly minted token (partial_hash absent on
+            // the input side) may only be issued into a single UTXO.
+            if (outputCountMap[tokenId] > 1) {
+                return TokenCheckResult::MINT_MULTIPLE_OUTPUTS;
+            }
+            continue;
+        }
+        if (it->second != outputAmount) {
+            return TokenCheckResult::AMOUNT_MISMATCH;
+        }
+    }
+    return TokenCheckResult::OK;
+}
+
+TokenCheckResult CheckPoolNftTape(const CTransaction& tx,
+                                  const PrevTxFetcher& prevTxFetcher) {
+    // Only run the check when vout[1] ends with the "NTape" flag and
+    // vout[0] (the pool contract) ends with the "2Code" marker.
+    if (tx.vout.size() < 2 ||
+        !MatchesNTapePattern(tx.vout[1].scriptPubKey) ||
+        !HasCodeMarkerSuffix(tx.vout[0].scriptPubKey)) {
+        return TokenCheckResult::OK;
+    }
+    if (tx.vin.empty()) {
+        return TokenCheckResult::POOLNFT_TAPE_TAMPERED;
+    }
+
+    // Per the spec: take the transaction referenced by vin[0]'s
+    // {pre_txid, 0} and read the old tape at {pre_txid, 1} (poolnft
+    // positions are fixed: vout[0] contract, vout[1] tape).
+    const TxId& prevTxId = tx.vin[0].prevout.GetTxId();
+    const CTransactionRef prevTx = prevTxFetcher ? prevTxFetcher(prevTxId)
+                                                 : nullptr;
+    if (!prevTx) {
+        return TokenCheckResult::PREV_TX_UNAVAILABLE;
+    }
+
+    // createPoolNFT: the previous transaction is usually a funding
+    // transaction that may lack vout[1], or whose vout[1] is change or not a
+    // poolnft tape (same recognition: "NTape"-suffixed vout[1] plus
+    // "2Code"-suffixed contract at vout[0]) -- treat it as minting a new
+    // pool and skip the tamper comparison.
+    if (prevTx->vout.size() < 2 ||
+        !MatchesNTapePattern(prevTx->vout[1].scriptPubKey) ||
+        !HasCodeMarkerSuffix(prevTx->vout[0].scriptPubKey)) {
+        return TokenCheckResult::OK;
+    }
+
+    const CScript& newTape = tx.vout[1].scriptPubKey;
+    const CScript& oldTape = prevTx->vout[1].scriptPubKey;
+    if (!PoolNftTapesMatchExceptAmount(newTape, oldTape)) {
+        return TokenCheckResult::POOLNFT_TAPE_TAMPERED;
+    }
+    return TokenCheckResult::OK;
+}
+
+TokenCheckResult CheckTokenTransaction(const CTransaction& tx,
+                                       const PrevTxFetcher& prevTxFetcher) {
+    const auto conservation = CheckTokenAmountConservation(tx, prevTxFetcher);
+    if (conservation != TokenCheckResult::OK) {
+        return conservation;
+    }
+    return CheckPoolNftTape(tx, prevTxFetcher);
+}
+
+} // namespace token_protection
