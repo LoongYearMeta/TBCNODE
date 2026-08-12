@@ -283,6 +283,169 @@ BOOST_AUTO_TEST_CASE(MempoolJournalTopoOrderAfterRemoveForBlock) {
                 CJournalTester::TxnOrder::BEFORE);
 }
 
+// A descendant's partial fee surplus must remain part of the unresolved CPFP
+// package so that a later descendant can finish paying the ancestor debt.
+BOOST_AUTO_TEST_CASE(MempoolJournalAccumulatesPartialCpfpSurplus) {
+    const CTransaction parent{MakeRootTx()};
+    const CTransaction child{MakeChildTx(parent)};
+    const CTransaction grandchild{MakeChildTx(child)};
+
+    const CFeeRate miningFeeRate{Amount{1000}};
+    auto requiredFee = [&miningFeeRate](const CTransaction& tx) {
+        return miningFeeRate.GetFee(tx.GetTotalSize());
+    };
+
+    {
+        CTxMemPool pool;
+        TestMemPoolEntryHelper entry;
+        pool.SetBlockMinTxFee(miningFeeRate);
+
+        // parent: -10 sat, child: +6 sat, grandchild: +4 sat. The complete
+        // ancestor package exactly meets blockMinTxfee.
+        pool.AddUnchecked(parent.GetId(),
+                          entry.Fee(requiredFee(parent) - Amount{10}).FromTx(parent),
+                          nullChangeSet);
+        pool.AddUnchecked(child.GetId(),
+                          entry.Fee(requiredFee(child) + Amount{6}).FromTx(child),
+                          nullChangeSet);
+
+        auto journal = pool.getJournalBuilder().getCurrentJournal();
+        BOOST_CHECK(!journal->checkTxnExists(parent.GetId()));
+        BOOST_CHECK(!journal->checkTxnExists(child.GetId()));
+
+        pool.AddUnchecked(grandchild.GetId(),
+                          entry.Fee(requiredFee(grandchild) + Amount{4}).FromTx(grandchild),
+                          nullChangeSet);
+
+        BOOST_CHECK(journal->checkTxnExists(parent.GetId()));
+        BOOST_CHECK(journal->checkTxnExists(child.GetId()));
+        BOOST_CHECK(journal->checkTxnExists(grandchild.GetId()));
+    }
+
+    {
+        CTxMemPool pool;
+        TestMemPoolEntryHelper entry;
+        pool.SetBlockMinTxFee(miningFeeRate);
+
+        // One satoshi short in aggregate must keep the whole package out of
+        // the journal.
+        pool.AddUnchecked(parent.GetId(),
+                          entry.Fee(requiredFee(parent) - Amount{10}).FromTx(parent),
+                          nullChangeSet);
+        pool.AddUnchecked(child.GetId(),
+                          entry.Fee(requiredFee(child) + Amount{6}).FromTx(child),
+                          nullChangeSet);
+        pool.AddUnchecked(grandchild.GetId(),
+                          entry.Fee(requiredFee(grandchild) + Amount{3}).FromTx(grandchild),
+                          nullChangeSet);
+
+        auto journal = pool.getJournalBuilder().getCurrentJournal();
+        BOOST_CHECK(!journal->checkTxnExists(parent.GetId()));
+        BOOST_CHECK(!journal->checkTxnExists(child.GetId()));
+        BOOST_CHECK(!journal->checkTxnExists(grandchild.GetId()));
+    }
+}
+
+// Surplus from multiple branches may combine when a transaction depends on
+// both branches. Their shared ancestor must contribute its debt only once.
+BOOST_AUTO_TEST_CASE(MempoolJournalAccumulatesCpfpSurplusAcrossConvergingDag) {
+    const CTransaction root{MakeRootTx(2)};
+    const CTransaction left{MakeChildTx(root, 0)};
+    const CTransaction right{MakeChildTx(root, 1)};
+    const CTransaction merge{MakeTwoParentTx(left, right)};
+
+    const CFeeRate miningFeeRate{Amount{1000}};
+    auto requiredFee = [&miningFeeRate](const CTransaction& tx) {
+        return miningFeeRate.GetFee(tx.GetTotalSize());
+    };
+
+    CTxMemPool pool;
+    TestMemPoolEntryHelper entry;
+    pool.SetBlockMinTxFee(miningFeeRate);
+
+    // root: -10 sat, each branch: +3 sat, merge: +4 sat. Neither branch
+    // independently covers the root, but their converged ancestor package does.
+    pool.AddUnchecked(root.GetId(),
+                      entry.Fee(requiredFee(root) - Amount{10}).FromTx(root),
+                      nullChangeSet);
+    pool.AddUnchecked(left.GetId(),
+                      entry.Fee(requiredFee(left) + Amount{3}).FromTx(left),
+                      nullChangeSet);
+    pool.AddUnchecked(right.GetId(),
+                      entry.Fee(requiredFee(right) + Amount{3}).FromTx(right),
+                      nullChangeSet);
+
+    auto journal = pool.getJournalBuilder().getCurrentJournal();
+    BOOST_CHECK(!journal->checkTxnExists(root.GetId()));
+    BOOST_CHECK(!journal->checkTxnExists(left.GetId()));
+    BOOST_CHECK(!journal->checkTxnExists(right.GetId()));
+
+    pool.AddUnchecked(merge.GetId(),
+                      entry.Fee(requiredFee(merge) + Amount{4}).FromTx(merge),
+                      nullChangeSet);
+
+    mining::CJournalEntry rootEntry{*pool.mapTx.find(root.GetId())};
+    mining::CJournalEntry leftEntry{*pool.mapTx.find(left.GetId())};
+    mining::CJournalEntry rightEntry{*pool.mapTx.find(right.GetId())};
+    mining::CJournalEntry mergeEntry{*pool.mapTx.find(merge.GetId())};
+    mining::CJournalTester tester{journal};
+
+    BOOST_CHECK(tester.checkTxnExists(rootEntry));
+    BOOST_CHECK(tester.checkTxnExists(leftEntry));
+    BOOST_CHECK(tester.checkTxnExists(rightEntry));
+    BOOST_CHECK(tester.checkTxnExists(mergeEntry));
+    BOOST_CHECK(tester.checkTxnOrdering(rootEntry, leftEntry) ==
+                mining::CJournalTester::TxnOrder::BEFORE);
+    BOOST_CHECK(tester.checkTxnOrdering(rootEntry, rightEntry) ==
+                mining::CJournalTester::TxnOrder::BEFORE);
+    BOOST_CHECK(tester.checkTxnOrdering(leftEntry, mergeEntry) ==
+                mining::CJournalTester::TxnOrder::BEFORE);
+    BOOST_CHECK(tester.checkTxnOrdering(rightEntry, mergeEntry) ==
+                mining::CJournalTester::TxnOrder::BEFORE);
+}
+
+BOOST_AUTO_TEST_CASE(MempoolReorgRechecksReaddedParentForJournal) {
+    CTxMemPool pool;
+    TestMemPoolEntryHelper entry;
+
+    const CTransaction parent{MakeRootTx()};
+    const CTransaction child{MakeChildTx(parent)};
+    const CFeeRate miningFeeRate{Amount{1000}};
+    pool.SetBlockMinTxFee(miningFeeRate);
+
+    const Amount parentDebt{miningFeeRate.GetFee(parent.GetTotalSize())};
+    const Amount childRequiredFee{miningFeeRate.GetFee(child.GetTotalSize())};
+
+    // The child enters while its parent is confirmed and independently has
+    // enough surplus to pay the parent's debt if the parent is disconnected.
+    pool.AddUnchecked(child.GetId(),
+                      entry.Fee(childRequiredFee + parentDebt).FromTx(child),
+                      nullChangeSet);
+    BOOST_REQUIRE(pool.getJournalBuilder().getCurrentJournal()->checkTxnExists(
+        child.GetId()));
+
+    auto changeSet = pool.getJournalBuilder().getNewChangeSet(
+        mining::JournalUpdateReason::REORG);
+    pool.AddUnchecked(parent.GetId(),
+                      entry.Fee(Amount{0}).FromTx(parent),
+                      changeSet);
+    BOOST_CHECK(!pool.getJournalBuilder().getCurrentJournal()->checkTxnExists(
+        parent.GetId()));
+
+    pool.UpdateTransactionsFromBlock({parent.GetId()}, changeSet);
+    changeSet->apply();
+
+    auto journal = pool.getJournalBuilder().getCurrentJournal();
+    mining::CJournalEntry parentEntry{*pool.mapTx.find(parent.GetId())};
+    mining::CJournalEntry childEntry{*pool.mapTx.find(child.GetId())};
+    mining::CJournalTester tester{journal};
+    BOOST_CHECK(tester.checkTxnExists(parentEntry));
+    BOOST_CHECK(tester.checkTxnExists(childEntry));
+    BOOST_CHECK(tester.checkTxnOrdering(parentEntry, childEntry) ==
+                mining::CJournalTester::TxnOrder::BEFORE);
+    BOOST_CHECK(pool.CheckJournal().empty());
+}
+
 // Regression test for the reorg insertionIndex fixup (Phase 4).
 //
 // A reorg re-adds previously-confirmed transactions and can re-add a parent
@@ -314,6 +477,7 @@ BOOST_AUTO_TEST_CASE(MempoolReorgReassignsInsertionIndex) {
     // point), then the parent is re-added -- mimicking a block disconnect that
     // re-adds the parent underneath an existing child.
     pool.AddUnchecked(c.GetId(), entry.Fee(Amount(10000LL)).FromTx(c), nullChangeSet);
+    BOOST_CHECK_EQUAL(pool.mapTx.find(c.GetId())->GetAncestorsHeight(), 0UL);
     pool.AddUnchecked(p.GetId(), entry.Fee(Amount(10000LL)).FromTx(p), nullChangeSet);
 
     auto pIdx = [&] { return pool.mapTx.find(p.GetId())->GetInsertionIndex(); };
@@ -327,6 +491,20 @@ BOOST_AUTO_TEST_CASE(MempoolReorgReassignsInsertionIndex) {
 
     // After fixup the parent precedes the child topologically.
     BOOST_CHECK(pIdx() < cIdx());
+
+    // C was accepted while P was confirmed, so reconnecting P must also make
+    // C an unconfirmed descendant rather than leaving its old height of zero.
+    BOOST_CHECK_EQUAL(pool.mapTx.find(c.GetId())->GetAncestorsHeight(), 1UL);
+    BOOST_CHECK(!pool.TransactionWithinChainLimit(c.GetId(), 1));
+
+    // At a height limit of two, D would have height two (P -> C -> D) and
+    // must therefore be rejected. Before the height fixup, C's stale zero
+    // made this check incorrectly succeed.
+    CMutableTransaction d = MakeChildTx(CTransaction(c));
+    CTxMemPool::setEntries ancestors;
+    std::string errString;
+    BOOST_CHECK(!pool.CalculateMemPoolAncestors(
+        entry.Fee(Amount(10000LL)).FromTx(d), ancestors, 2, errString));
 }
 
 BOOST_AUTO_TEST_CASE(MempoolReorgReassignsInsertionIndexForConnectedComponent) {
@@ -376,6 +554,21 @@ BOOST_AUTO_TEST_CASE(MempoolReorgReassignsInsertionIndexForConnectedComponent) {
     BOOST_CHECK(InsertionIndex(pool, c.GetId()) < InsertionIndex(pool, e.GetId()));
     BOOST_CHECK(InsertionIndex(pool, d.GetId()) < InsertionIndex(pool, e.GetId()));
 
+    // All pre-existing descendants must have heights refreshed across the
+    // reconnected component, including the two-parent descendant e.
+    BOOST_CHECK_EQUAL(pool.mapTx.find(r.GetId())->GetAncestorsHeight(), 0UL);
+    BOOST_CHECK_EQUAL(pool.mapTx.find(a.GetId())->GetAncestorsHeight(), 1UL);
+    BOOST_CHECK_EQUAL(pool.mapTx.find(b.GetId())->GetAncestorsHeight(), 1UL);
+    BOOST_CHECK_EQUAL(pool.mapTx.find(c.GetId())->GetAncestorsHeight(), 2UL);
+    BOOST_CHECK_EQUAL(pool.mapTx.find(d.GetId())->GetAncestorsHeight(), 2UL);
+    BOOST_CHECK_EQUAL(pool.mapTx.find(e.GetId())->GetAncestorsHeight(), 3UL);
+
+    CMutableTransaction f = MakeChildTx(CTransaction(e));
+    CTxMemPool::setEntries ancestors;
+    std::string errString;
+    BOOST_CHECK(!pool.CalculateMemPoolAncestors(
+        entry.Fee(Amount(10000LL)).FromTx(f), ancestors, 4, errString));
+
     CTxMemPool::setEntries descendants;
     pool.CalculateDescendants(pool.mapTx.find(r.GetId()), descendants);
     BOOST_CHECK_EQUAL(descendants.size(), 6UL);
@@ -390,8 +583,8 @@ BOOST_AUTO_TEST_CASE(MempoolReorgReassignsInsertionIndexForConnectedComponent) {
 BOOST_AUTO_TEST_CASE(MempoolAdmissionFeeCurveTest) {
     // The mempool is never trimmed; admission is bounded by a size-dependent
     // fee floor (CTxMemPool::GetMinFee). Below the ramp start (N1) the floor is
-    // returned verbatim; between N1 and N2 the required feerate rises
-    // hyperbolically with a pole at N2; at/above N2 it clamps to the ceiling.
+    // returned verbatim; between N1 and N2 the required feerate follows an
+    // alpha=3 reciprocal ramp; at/above N2 it reports the policy ceiling.
     CTxMemPool pool;
     TestMemPoolEntryHelper entry;
 
@@ -426,16 +619,17 @@ BOOST_AUTO_TEST_CASE(MempoolAdmissionFeeCurveTest) {
     BOOST_CHECK(config.SetMempoolFeeRampStart(usage + 1, &err));
     BOOST_CHECK_EQUAL(pool.GetMinFee(usage * 4).GetFeePerK(), Amount(floorRate));
 
-    // On the ramp (N1 = 0): rate = floor * (N2 - N1) / (N2 - usage).
+    // On the ramp (N1 = 0):
+    //   rate = floor * ((N2 - N1) / (N2 - usage))^3.
     BOOST_CHECK(config.SetMempoolFeeRampStart(0, &err));
-    //   N2 = 2*usage -> floor * 2u / u = 2 * floor.
+    //   N2 = 2*usage -> floor * (2u/u)^3 = 8 * floor.
     BOOST_CHECK_EQUAL(pool.GetMinFee(usage * 2).GetFeePerK(),
-                      Amount(2 * floorRate));
-    //   N2 = 4*usage -> floor * 4u / 3u = 1333 (integer division, exact for any u).
+                      Amount(8 * floorRate));
+    //   N2 = 4*usage -> floor * (4u/3u)^3 = floor * 64/27.
     BOOST_CHECK_EQUAL(pool.GetMinFee(usage * 4).GetFeePerK(),
-                      Amount(4 * floorRate / 3));
+                      Amount(64 * floorRate / 27));
 
-    // At/above the hard cap (N2 <= usage): clamp to the ceiling.
+    // At/above the N2 protection threshold: report the policy ceiling.
     BOOST_CHECK_EQUAL(pool.GetMinFee(usage).GetFeePerK(),
                       MAX_MEMPOOL_RAMP_FEE_RATE);
 
@@ -446,7 +640,7 @@ BOOST_AUTO_TEST_CASE(MempoolAdmissionFeeCurveTest) {
 
     // The hyperbolic ramp itself clamps when the computed rate would exceed the
     // ceiling. With the floor sitting at the ceiling, any ramp factor > 1
-    // saturates: N1 = 0, N2 = 2*usage -> floor * 2 -> clamped back to the cap.
+    // saturates: N1 = 0, N2 = 2*usage -> floor * 8 -> clamped back to the cap.
     BOOST_CHECK(config.SetMempoolFeeRampStart(0, &err));
     BOOST_CHECK(config.SetMempoolMinFeePerKB(
         MAX_MEMPOOL_RAMP_FEE_RATE.GetSatoshis(), &err));
@@ -454,12 +648,12 @@ BOOST_AUTO_TEST_CASE(MempoolAdmissionFeeCurveTest) {
                       MAX_MEMPOOL_RAMP_FEE_RATE);
     BOOST_CHECK(config.SetMempoolMinFeePerKB(floorRate, &err)); // restore floor
 
-    // Degenerate config (N2 <= N1) is treated as flat even when usage > N1: the
-    // floor is returned rather than falling through to the ramp/clamp branches.
+    // The N2 guard takes precedence for a degenerate N2 <= N1 configuration.
+    // Current usage is already above N2, so the policy ceiling is returned.
     BOOST_CHECK(config.SetMempoolFeeRampStart(usage / 2, &err));
     BOOST_CHECK(usage / 2 < usage);                          // usage is above N1
     BOOST_CHECK_EQUAL(pool.GetMinFee(usage / 4).GetFeePerK(), // and N2 <= N1
-                      Amount(floorRate));
+                      MAX_MEMPOOL_RAMP_FEE_RATE);
 
     // Restore policy defaults so other tests are unaffected.
     BOOST_CHECK(config.SetMempoolMinFeePerKB(

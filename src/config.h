@@ -69,17 +69,8 @@ public:
     virtual void SetDataCarrierSize(uint64_t dataCarrierSize) = 0;
     virtual uint64_t GetDataCarrierSize() const = 0;
 
-    virtual void SetLimitAncestorSize(uint64_t limitAncestorSize) = 0;
-    virtual uint64_t GetLimitAncestorSize() const = 0;
-
-    virtual void SetLimitDescendantSize(uint64_t limitDescendantSize) = 0;
-    virtual uint64_t GetLimitDescendantSize() const = 0;
-
     virtual void SetLimitAncestorCount(uint64_t limitAncestorCount) = 0;
     virtual uint64_t GetLimitAncestorCount() const = 0;
-
-    virtual void SetLimitDescendantCount(uint64_t limitDescendantCount) = 0;
-    virtual uint64_t GetLimitDescendantCount() const = 0;
 
     virtual void SetTestBlockCandidateValidity(bool test) = 0;
     virtual bool GetTestBlockCandidateValidity() const = 0;
@@ -160,8 +151,9 @@ public:
     virtual uint64_t GetMemPoolExpiry() const = 0;
 
     // Mempool admission fee curve (no-trim policy). N1 = ramp start (bytes),
-    // N2 = GetMaxMempool(). Below N1 the floor applies; between N1 and N2 the
-    // required feerate rises hyperbolically with a pole at N2.
+    // N2 = GetMaxMempool(), the admission protection threshold. Below N1 the
+    // floor applies; between N1 and N2 the feerate follows a policy-clamped
+    // alpha=3 reciprocal ramp. Admission stops once current usage reaches N2.
     virtual bool SetMempoolFeeRampStart(int64_t rampStart, std::string* err) = 0;
     virtual uint64_t GetMempoolFeeRampStart() const = 0;
     virtual bool SetMempoolMinFeePerKB(int64_t feePerKB, std::string* err) = 0;
@@ -224,17 +216,8 @@ public:
     void SetDataCarrierSize(uint64_t dataCarrierSize) override;
     uint64_t GetDataCarrierSize() const override;
 
-    void SetLimitAncestorSize(uint64_t limitAncestorSize) override;
-    uint64_t GetLimitAncestorSize() const override;
-
-    void SetLimitDescendantSize(uint64_t limitDescendantSize) override;
-    uint64_t GetLimitDescendantSize() const override;
-
     void SetLimitAncestorCount(uint64_t limitAncestorCount) override;
     uint64_t GetLimitAncestorCount() const override;
-
-    void SetLimitDescendantCount(uint64_t limitDescendantCount) override;
-    uint64_t GetLimitDescendantCount() const override;
 
     void SetTestBlockCandidateValidity(bool test) override;
     bool GetTestBlockCandidateValidity() const override;
@@ -365,10 +348,7 @@ private:
     uint64_t minConsolidationInputMaturity;
     uint64_t acceptNonStdConsolidationInput;
     uint64_t dataCarrierSize;
-    uint64_t limitDescendantCount;
     uint64_t limitAncestorCount;
-    uint64_t limitDescendantSize;
-    uint64_t limitAncestorSize;
 
     bool testBlockCandidateValidity;
     mining::CMiningFactory::BlockAssemblerType blockAssemblerType;
@@ -504,17 +484,8 @@ public:
     uint64_t GetDataCarrierSize() const override { return dataCarrierSize; }
     void SetDataCarrierSize(uint64_t dataCarrierSizeIn) override { dataCarrierSize = dataCarrierSizeIn; }
 
-    void SetLimitAncestorSize(uint64_t limitAncestorSize) override {}
-    uint64_t GetLimitAncestorSize() const override { return 0; }
-
-    void SetLimitDescendantSize(uint64_t limitDescendantSize) override {}
-    uint64_t GetLimitDescendantSize() const override { return 0; }
-
     void SetLimitAncestorCount(uint64_t limitAncestorCount) override {}
     uint64_t GetLimitAncestorCount() const override { return 0; }
-
-    void SetLimitDescendantCount(uint64_t limitDescendantCount) override {}
-    uint64_t GetLimitDescendantCount() const override { return 0; }
 
     void SetTestBlockCandidateValidity(bool skip) override {}
     bool GetTestBlockCandidateValidity() const override { return false; }

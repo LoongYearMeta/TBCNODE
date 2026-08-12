@@ -440,8 +440,8 @@ UniValue getmempoolancestors(const Config &config,
     CTxMemPool::setEntries setAncestors;
     uint64_t noLimit = std::numeric_limits<uint64_t>::max();
     std::string dummy;
-    mempool.CalculateMemPoolAncestorsNL(*txIter, setAncestors, noLimit, noLimit,
-                                        noLimit, noLimit, dummy, false);
+    mempool.CalculateMemPoolAncestorsNL(
+        *txIter, setAncestors, noLimit, dummy, false);
     if (!fVerbose) {
         UniValue o(UniValue::VARR);
         for (CTxMemPool::txiter ancestorIt : setAncestors) {
@@ -1770,7 +1770,8 @@ UniValue mempoolInfoToJSON(const Config& config) {
     ret.push_back(Pair("maxmempool", (int64_t)maxmempool));
     // Current size-dependent admission fee floor (the curve evaluated at the
     // current usage). Below the ramp start it equals mempoolfloorfee; as usage
-    // approaches maxmempool it rises hyperbolically.
+    // approaches maxmempool it follows an alpha=3 reciprocal ramp up to the
+    // policy fee-rate ceiling.
     ret.push_back(
         Pair("mempoolminfee",
              ValueFromAmount(mempool.GetMinFee(maxmempool).GetFeePerK())));
@@ -1801,11 +1802,12 @@ UniValue getmempoolinfo(const Config &config, const JSONRPCRequest &request) {
             "the mempool\n"
             "  \"nonfinalusage\": xxxxx,      (numeric) Total memory usage for "
             "the non-final mempool\n"
-            "  \"maxmempool\": xxxxx,         (numeric) Maximum memory usage "
-            "for the mempool (the hard size cap; the mempool is never trimmed)\n"
+            "  \"maxmempool\": xxxxx,         (numeric) N2 mempool "
+            "admission protection threshold; new transactions are rejected "
+            "once reached\n"
             "  \"mempoolminfee\": xxxxx,      (numeric) Current minimum feerate "
-            "for a tx to be accepted, given current mempool usage. Rises "
-            "hyperbolically from mempoolfloorfee toward maxmempool\n"
+            "for a tx to be accepted, given current mempool usage. Follows "
+            "an alpha=3 reciprocal ramp, capped at the policy ceiling\n"
             "  \"mempoolfloorfee\": xxxxx,    (numeric) Configured admission fee "
             "floor charged while usage is below mempoolfeerampstart "
             "(-mempoolminfeerate)\n"
@@ -2687,13 +2689,22 @@ static const CRPCCommand commands[] = {
     { "hidden",             "waitforblockheight",     waitforblockheight,     true,  {"height","timeout"} },
     { "hidden",             "getblockchainactivity",  getblockchainactivity,  true,  {} },
     { "hidden",             "getcurrentlyvalidatingblocks",     getcurrentlyvalidatingblocks,     true,  {} },
-    { "hidden",             "waitaftervalidatingblock",         waitaftervalidatingblock,         true,  {"blockhash","action"} },
     { "hidden",             "getwaitingblocks",                 getwaitingblocks,            true,  {} }
+};
+
+static const CRPCCommand waitAfterValidatingBlockCommand {
+    "hidden", "waitaftervalidatingblock", waitaftervalidatingblock, true,
+    {"blockhash", "action"}
 };
 // clang-format on
 
 void RegisterBlockchainRPCCommands(CRPCTable &t) {
     for (unsigned int vcidx = 0; vcidx < ARRAYLEN(commands); vcidx++) {
         t.appendCommand(commands[vcidx].name, &commands[vcidx]);
+    }
+
+    if (Params().NetworkIDString() == CBaseChainParams::REGTEST) {
+        t.appendCommand(waitAfterValidatingBlockCommand.name,
+                        &waitAfterValidatingBlockCommand);
     }
 }

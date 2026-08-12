@@ -5,6 +5,7 @@
 
 #include "txmempool.h"
 
+#include "arith_uint256.h"
 #include "chainparams.h" // for GetConsensus.
 #include "clientversion.h"
 #include "consensus/consensus.h"
@@ -177,7 +178,14 @@ void CTxMemPool::UpdateTransactionsFromBlock(
     component.insert(addedTransactions.begin(), addedTransactions.end());
     reassignInsertionIndicesNL(component);
 
-    checkJournalAcceptanceNL(affected, nonNullChangeSet.Get());
+    // Re-adding a previously-confirmed parent can make an existing child gain
+    // an unconfirmed ancestor. Recompute heights over the now-topologically
+    // ordered component before any chain-limit checks observe stale values.
+    setEntriesTopoSorted heightsToUpdate;
+    heightsToUpdate.insert(component.begin(), component.end());
+    UpdateAncestorsHeightNL(std::move(heightsToUpdate));
+
+    checkJournalAcceptanceNL(component, nonNullChangeSet.Get());
 }
 
 void CTxMemPool::reassignInsertionIndicesNL(const setEntries& entries)
@@ -236,20 +244,14 @@ void CTxMemPool::reassignInsertionIndicesNL(const setEntries& entries)
 bool CTxMemPool::CalculateMemPoolAncestors(
     const CTxMemPoolEntry &entry,
     setEntries &setAncestors,
-    uint64_t limitAncestorCount,
-    uint64_t limitAncestorSize,
-    uint64_t limitDescendantCount,
-    uint64_t limitDescendantSize,
+    uint64_t limitAncestorHeight,
     std::string &errString,
     bool fSearchForParents /* = true */) const {
 
     std::shared_lock lock(smtx);
     return CalculateMemPoolAncestorsNL(entry,
                                        setAncestors,
-                                       limitAncestorCount,
-                                       limitAncestorSize,
-                                       limitDescendantCount,
-                                       limitDescendantSize,
+                                       limitAncestorHeight,
                                        errString,
                                        fSearchForParents);
 }
@@ -257,10 +259,7 @@ bool CTxMemPool::CalculateMemPoolAncestors(
 bool CTxMemPool::CalculateMemPoolAncestorsNL(
     const CTxMemPoolEntry &entry,
     setEntries &setAncestors,
-    uint64_t limitAncestorCount,
-    uint64_t limitAncestorSize,
-    uint64_t limitDescendantCount,
-    uint64_t limitDescendantSize,
+    uint64_t limitAncestorHeight,
     std::string &errString,
     bool fSearchForParents /* = true */) const {
 
@@ -279,10 +278,10 @@ bool CTxMemPool::CalculateMemPoolAncestorsNL(
             }
             parentHashes.insert(piter);
             ancestorsHeight = std::max(ancestorsHeight, piter->GetAncestorsHeight() + 1);
-            if (ancestorsHeight >= limitAncestorCount) {
+            if (ancestorsHeight >= limitAncestorHeight) {
                 errString =
                     strprintf("too many unconfirmed parents [limit: %u]",
-                              limitAncestorCount);
+                              limitAncestorHeight);
                 return false;
             }
         }
@@ -293,14 +292,11 @@ bool CTxMemPool::CalculateMemPoolAncestorsNL(
         parentHashes = GetMemPoolParentsNL(it);
     }
 
-    size_t totalSizeWithAncestors = entry.GetTxSize();
-
     while (!parentHashes.empty()) {
         txiter stageit = *parentHashes.begin();
 
         setAncestors.insert(stageit);
         parentHashes.erase(stageit);
-        totalSizeWithAncestors += stageit->GetTxSize();
 
         const setEntries &setMemPoolParents = GetMemPoolParentsNL(stageit);
         size_t ancestorsHeight = 0;
@@ -311,10 +307,10 @@ bool CTxMemPool::CalculateMemPoolAncestorsNL(
             }
             ancestorsHeight = std::max(ancestorsHeight, phash->GetAncestorsHeight() + 1);
             if (ancestorsHeight >=
-                limitAncestorCount) {
+                limitAncestorHeight) {
                 errString =
                     strprintf("too many unconfirmed ancestors [limit: %u]",
-                              limitAncestorCount);
+                              limitAncestorHeight);
                 return false;
             }
         }
@@ -1615,19 +1611,6 @@ void CTxMemPool::checkJournalAcceptanceNL(const CTxMemPool::setEntries& affected
         return txs;
     };
 
-    // returns debt of the transaction, regardless of the parents
-    auto calculateDebt = [this](txiter entry){
-        auto fee = entry->GetModifiedFee();
-        auto neededFee = blockMinTxfee.GetFee(entry->GetTxSize());
-        if(fee < neededFee)
-        {
-            return neededFee - fee;
-        }
-        return Amount(0);
-    };
-
-
-    
     auto txsToCheck = topoSortedTxFromSet(affectedTransactions);
     
     // limit ourself to fixed number of recalculation rounds
@@ -1645,7 +1628,8 @@ void CTxMemPool::checkJournalAcceptanceNL(const CTxMemPool::setEntries& affected
         // so if we accepted transactions through cpfp we will revisit all transactions that did not make it to the journal
         bool cpfpExecuted = false;
 
-        // keys are entries that do not pay enough, values are sets of the their's ancestors which do not pay enough
+        // Keys are entries whose ancestor-closed package does not pay enough;
+        // values are the unresolved ancestors in that package.
         std::map<txiter, setEntries, CompareIteratorByHash> nonPayingTxWithAncestors;
 
         for(txiter ent: txsToCheck)
@@ -1666,17 +1650,19 @@ void CTxMemPool::checkJournalAcceptanceNL(const CTxMemPool::setEntries& affected
                 nonpayingAncestors.insert(parent);
             }
 
-            // now sum up all ancestor's debt (if any)
-            Amount ancestorsDebt(0);
+            // Evaluate the whole unresolved ancestor package. In particular,
+            // retain surplus from an intermediate descendant so it can combine
+            // with a later descendant's fee. The set also ensures shared
+            // ancestors are counted only once.
+            Amount packageFee = ent->GetModifiedFee();
+            Amount packageRequiredFee = blockMinTxfee.GetFee(ent->GetTxSize());
             for(txiter ancestor: nonpayingAncestors)
             {
-                ancestorsDebt += calculateDebt(ancestor);
+                packageFee += ancestor->GetModifiedFee();
+                packageRequiredFee += blockMinTxfee.GetFee(ancestor->GetTxSize());
             }
 
-            Amount fee = ent->GetModifiedFee();
-            Amount excessFee = fee - blockMinTxfee.GetFee(ent->GetTxSize()); 
-
-            if(excessFee >= ancestorsDebt)
+            if(packageFee >= packageRequiredFee)
             {
                 // Great! This transactions pays enough, first remove ancestors from the debt list (if any) 
                 // and add them to the journal (in topo-order)
@@ -1854,9 +1840,6 @@ void CTxMemPool::AddUnchecked(
             entry,
             setAncestors,
             nNoLimit,
-            nNoLimit,
-            nNoLimit,
-            nNoLimit,
             dummy);
 
         AddUncheckedNL(
@@ -1907,62 +1890,87 @@ CTxMemPool::GetMemPoolChildrenNL(txiter entry) const {
 
 // Size-dependent mempool admission fee floor (no-trim policy).
 //
-// The floor is a piecewise function of current mempool usage:
-//   usage <= N1            : floorRate                          (flat)
-//   N1 <  usage < N2       : floorRate * (N2 - N1) / (N2 - usage) (ramp)
-//   usage >= N2            : clamped ceiling (hard reject handled at admission)
-// where N1 = -mempoolfeerampstart and N2 = -maxmempool (the hard size cap).
+// For a valid N1 < N2 configuration, the floor is a piecewise function of
+// current mempool usage:
+//   usage <= N1      : floorRate                                      (flat)
+//   N1 < usage < N2 : floorRate * ((N2 - N1) / (N2 - usage))^3       (ramp)
+//   usage >= N2      : clamped ceiling (hard reject handled at admission)
+// where N1 = -mempoolfeerampstart and N2 = -maxmempool (the admission
+// protection threshold).
 //
-// The ramp is a reciprocal barrier function C/(N2 - usage) with a pole at N2
-// (the same family as interior-point barrier functions). It is chosen over a
-// bounded exponential floor*(ceil/floor)^frac for three reasons:
+// The unclamped ramp is a cubic reciprocal barrier with a pole at N2. It
+// provides:
 //
-//  1. Unreachable cap. A bounded exponential tops out at a finite ceil at N2,
-//     so N2 is reachable by anyone willing to pay ceil. The barrier diverges at
-//     N2, so the fee required to push usage to N2 is infinite and the mempool
-//     asymptotes below N2 instead of ever filling it.
+//  1. Economic back-pressure. The marginal admission cost rises steeply before
+//     N2, discouraging new transactions as the node approaches its capacity.
+//     The finite fee-rate clamp is a policy ceiling; once current usage reaches
+//     N2, the separate admission gate protects the node from further growth.
 //  2. Determinism. This admission gate must give bit-identical results on the
 //     RPC and P2P paths (and across nodes). The barrier is pure integer math
-//     (128-bit, with an explicit clamp); an exponential needs pow()/exp() and
+//     (256-bit, with an explicit clamp); an exponential needs pow()/exp() and
 //     would reintroduce floating-point rounding differences at the margin.
 //  3. Back-pressure, not a cliff. A flat floor plus a hard cut at N2 accepts
 //     floor-fee txns right up to the wall and then thrashes at the cliff. The
 //     rising ramp makes marginal admission cost grow as the pool fills, so
-//     demand throttles smoothly before the cap.
+//     demand throttles smoothly before the protection threshold.
 //
-// The exponent alpha is fixed at 1; a steeper ramp would raise it to
-// ((N2-N1)/(N2-usage))^alpha. At usage == N1 the ramp equals floorRate exactly,
-// so the function is continuous at the ramp start.
+// N2 is deliberately reachable. A transaction admitted while usage is below
+// N2 may bring usage to or above the threshold; all subsequent admissions are
+// rejected until mining or expiry reduces usage. No fee-based eviction occurs.
+//
+// The exponent alpha is fixed at MEMPOOL_FEE_RAMP_EXPONENT (3). At usage == N1
+// the ramp equals floorRate exactly, so the function is continuous at the ramp
+// start.
 CFeeRate CTxMemPool::GetMinFee(size_t sizelimit) const {
     std::shared_lock lock(smtx);
     const Config& config = GlobalConfig::GetConfig();
     const int64_t floorRate =
         config.GetMempoolMinFeePerKB().GetFeePerK().GetSatoshis();
     const size_t N1 = config.GetMempoolFeeRampStart();
-    const size_t N2 = sizelimit; // hard size cap (no-trim)
+    const size_t N2 = sizelimit; // admission protection threshold (no-trim)
     const size_t usage = DynamicMemoryUsageNL();
 
+    // At/above the protection threshold the pool is full. Admission is
+    // hard-rejected separately, so this returns the policy fee-rate ceiling
+    // for reporting and defensive callers.
+    if (usage >= N2) {
+        return CFeeRate(MAX_MEMPOOL_RAMP_FEE_RATE);
+    }
     // Below the ramp start (or a degenerate N1 >= N2 config) the admission
     // floor is just the configured minimum feerate.
     if (usage <= N1 || N2 <= N1) {
         return CFeeRate(Amount(floorRate));
     }
-    // At/above the hard cap the pool is full. Admission is hard-rejected
-    // separately before this point, so this is only a safety clamp.
-    if (usage >= N2) {
+    // Unclamped cubic hyperbolic ramp between N1 and N2 (alpha = 3):
+    //   rate = floor * ((N2 - N1) / (N2 - usage))^3
+    // As usage approaches N2 the required feerate rises steeply until the
+    // policy clamp; the hard admission gate protects the pool at/above N2.
+    if (floorRate <= 0) {
+        return CFeeRate(Amount(floorRate));
+    }
+
+    // A 64-bit span cubed and multiplied by a positive int64 floor fits in
+    // 255 bits. arith_uint256 therefore preserves the exact integer result for
+    // every accepted configuration and avoids platform-dependent floating
+    // point rounding.
+    const arith_uint256 span(static_cast<uint64_t>(N2 - N1));
+    const arith_uint256 remaining(static_cast<uint64_t>(N2 - usage));
+    arith_uint256 numerator(static_cast<uint64_t>(floorRate));
+    arith_uint256 denominator(1);
+    for (unsigned int exponent = 0;
+         exponent < MEMPOOL_FEE_RAMP_EXPONENT;
+         ++exponent) {
+        numerator *= span;
+        denominator *= remaining;
+    }
+
+    const arith_uint256 rate = numerator / denominator;
+    const uint64_t maxRate =
+        static_cast<uint64_t>(MAX_MEMPOOL_RAMP_FEE_RATE.GetSatoshis());
+    if (rate > arith_uint256(maxRate)) {
         return CFeeRate(MAX_MEMPOOL_RAMP_FEE_RATE);
     }
-    // Hyperbolic ramp between N1 and N2 with a pole at N2 (alpha = 1):
-    //   rate = floor * (N2 - N1) / (N2 - usage)
-    // As usage approaches N2 the required feerate diverges, so in practice the
-    // mempool asymptotes below N2 instead of ever reaching it.
-    __int128 rate = (static_cast<__int128>(floorRate) *
-                     static_cast<int64_t>(N2 - N1)) /
-                    static_cast<int64_t>(N2 - usage);
-    if (rate > MAX_MEMPOOL_RAMP_FEE_RATE.GetSatoshis()) {
-        rate = MAX_MEMPOOL_RAMP_FEE_RATE.GetSatoshis();
-    }
-    return CFeeRate(Amount(static_cast<int64_t>(rate)));
+    return CFeeRate(Amount(static_cast<int64_t>(rate.GetLow64())));
 }
 
 bool CTxMemPool::TransactionWithinChainLimit(const uint256 &txid,

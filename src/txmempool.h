@@ -334,18 +334,10 @@ public:
  *
  * Computational limits:
  *
- * Updating all in-mempool ancestors of a newly added transaction can be slow,
- * if no bound exists on how many in-mempool ancestors there may be.
- * CalculateMemPoolAncestors() takes configurable limits that are designed to
- * prevent these calculations from being too CPU intensive.
+ * CalculateMemPoolAncestors() walks the full ancestor set. Admission limits the
+ * maximum dependency height; aggregate ancestor/descendant limits are not part
+ * of the current mempool policy.
  *
- * Adding transactions from a disconnected block can be very time consuming,
- * because we don't have a way to limit the number of in-mempool descendants. To
- * bound CPU processing, we limit the amount of work we're willing to do to
- * properly update the descendant information for a tx being added from a
- * disconnected block. If we would exceed the limit, then we instead mark the
- * entry as "dirty", and set the feerate for sorting purposes to be equal the
- * feerate of the transaction without any descendants.
  */
 class CTxMemPool {
 private:
@@ -610,10 +602,7 @@ public:
 
     /**
      * Try to calculate all in-mempool ancestors of entry.
-     *  limitAncestorCount = max ancestor chain height
-     *  limitAncestorSize = deprecated; retained for API compatibility
-     *  limitDescendantCount = deprecated; retained for API compatibility
-     *  limitDescendantSize = deprecated; retained for API compatibility
+     *  limitAncestorHeight = max ancestor chain height
      *  errString = populated with error reason if any limits are hit
      * fSearchForParents = whether to search a tx's vin for in-mempool parents,
      * or look up parents from mapLinks. Must be true for entries not in the
@@ -622,10 +611,7 @@ public:
     bool CalculateMemPoolAncestors(
             const CTxMemPoolEntry &entry,
             setEntries &setAncestors,
-            uint64_t limitAncestorCount,
-            uint64_t limitAncestorSize,
-            uint64_t limitDescendantCount,
-            uint64_t limitDescendantSize,
+            uint64_t limitAncestorHeight,
             std::string &errString,
             bool fSearchForParents = true) const;
     // A non-locking version of CalculateMemPoolAncestors
@@ -633,10 +619,7 @@ public:
     bool CalculateMemPoolAncestorsNL(
             const CTxMemPoolEntry &entry,
             setEntries &setAncestors,
-            uint64_t limitAncestorCount,
-            uint64_t limitAncestorSize,
-            uint64_t limitDescendantCount,
-            uint64_t limitDescendantSize,
+            uint64_t limitAncestorHeight,
             std::string &errString,
             bool fSearchForParents = true) const;
 
@@ -655,10 +638,11 @@ public:
 
     /**
      * The minimum feerate to get into the mempool, as a deterministic function
-     * of current mempool usage. With sizelimit == N2 (the hard cap): below the
-     * configured ramp start (N1) it returns the configured floor; between N1
-     * and N2 it rises hyperbolically (pole at N2) so that N2 is in practice
-     * unreachable. The mempool is never trimmed (no eviction).
+     * of current mempool usage. With sizelimit == N2 (the admission protection
+     * threshold): below the configured ramp start (N1) it returns the
+     * configured floor; between N1 and N2 it follows a policy-clamped
+     * alpha=3 reciprocal ramp. N2 may be reached, after which admission rejects
+     * new transactions. The mempool is never trimmed (no eviction).
      */
     CFeeRate GetMinFee(size_t sizelimit) const;
 
