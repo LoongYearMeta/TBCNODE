@@ -1558,6 +1558,8 @@ UniValue getblockchaininfo(const Config &config,
             "current best block\n"
             "  \"verificationprogress\": xxxx, (numeric) estimate of "
             "verification progress [0..1]\n"
+            "  \"initialblockdownload\": true|false, (boolean) whether the "
+            "node is still in initial block download\n"
             "  \"chainwork\": \"xxxx\"     (string) total amount of work in "
             "active chain, in hexadecimal\n"
             "  \"pruned\": xx,             (boolean) if the blocks are subject "
@@ -1582,6 +1584,12 @@ UniValue getblockchaininfo(const Config &config,
             HelpExampleRpc("getblockchaininfo", ""));
     }
 
+    // Expose the node's authoritative IBD latch. Downstream consumers must not
+    // infer this from GuessVerificationProgress: TBC's post-fork transaction
+    // rate makes that Bitcoin-era estimate materially different from 1.0 even
+    // when the active chain is fully caught up.
+    const bool initialBlockDownload = IsInitialBlockDownload();
+
     LOCK(cs_main);
 
     UniValue obj(UniValue::VOBJ);
@@ -1598,6 +1606,7 @@ UniValue getblockchaininfo(const Config &config,
         Pair("verificationprogress",
              GuessVerificationProgress(config.GetChainParams().TxData(),
                                        chainActive.Tip())));
+    obj.push_back(Pair("initialblockdownload", initialBlockDownload));
     obj.push_back(Pair("chainwork", chainActive.Tip()->nChainWork.GetHex()));
     obj.push_back(Pair("pruned", fPruneMode));
 

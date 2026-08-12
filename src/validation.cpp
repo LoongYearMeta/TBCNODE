@@ -922,6 +922,8 @@ bool FilledMinerBillV2(const CTransaction& tx, const uint256 tipBlockHash) {
     std::vector<XOnlyPubKey> pubkeyManagers;
     
     pubkeyManagers.emplace_back(ParseHex(
+        "563c222009a10d447b625bcddd3adfafa7c0c629ea3961c49629f2a3d822309e"));
+    pubkeyManagers.emplace_back(ParseHex(
         "84ddaab460c3e2d460a5c706746d3894928cfcac87a41840e1e5992ebf047b49"));
     pubkeyManagers.emplace_back(ParseHex(
         "f54e6c6619cfd2c2b62ce17fa0366b8a69ee0d97a4d9752e7286b71530dbf02e"));
@@ -1156,7 +1158,7 @@ bool CheckCoinbase(const CTransaction& tx, CValidationState& state, uint64_t max
                              : scriptSigHeight;
 
         constexpr int kycV1ActivationHeight = 824189;
-        constexpr int kycV2ActivationHeight = 927000;
+        constexpr int kycV2ActivationHeight = 824189;
         
         if (checkBlockHeight >=
                 static_cast<uint64_t>(kycV1ActivationHeight) &&
@@ -1832,7 +1834,7 @@ CTxnValResult TxnValidation(
                 bool prevTxGenesisEnabled {true};
                 if (GetTransactionNL(config, prevTxId, prevTx,
                                      true /* fAllowSlow */, hashBlock,
-                                     prevTxGenesisEnabled)) {
+                                   prevTxGenesisEnabled)) {
                     return prevTx;
                 }
                 return nullptr;
@@ -2779,11 +2781,11 @@ static void UpdateMempoolForReorg(const Config &config,
  * deadlock the node. See CTxnValidator::threadNewTxnHandler.
  */
 static bool GetTransactionNL(const Config &config, const TxId &txid,
-                             CTransactionRef &txOut,
-                             bool fAllowSlow,
-                             uint256 &hashBlock,
-                             bool& isGenesisEnabled
-                             ) {
+                    CTransactionRef &txOut,
+                    bool fAllowSlow,
+                    uint256 &hashBlock,
+                    bool& isGenesisEnabled
+                    ) {
     CBlockIndex *pindexSlow = nullptr;
     isGenesisEnabled = true;
 
