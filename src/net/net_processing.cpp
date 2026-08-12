@@ -131,8 +131,7 @@ struct CNodeState {
     bool fCurrentlyConnected {false};
     //! Accumulated misbehaviour score for this peer.
     int nMisbehavior {0};
-    //! Whether this peer should be disconnected and banned (unless
-    //! whitelisted).
+    //! Whether this peer should be disconnected and, unless exempt, banned.
     bool fShouldBan {false};
     //! String name of this peer (debugging/logging purposes).
     const std::string name {};
@@ -2671,10 +2670,12 @@ static void ProcessBlockTxnMessage(const Config& config, const CNodePtr& pfrom,
         }
         else if(status == READ_STATUS_FAILED) {
             // Might have collided, fall back to getdata now :(
+            MarkBlockAsReceived(resp.blockhash);
             std::vector<CInv> invs;
             invs.push_back(CInv(MSG_BLOCK, resp.blockhash));
             connman.PushMessage(pfrom,
                                 msgMaker.Make(NetMsgType::GETDATA, invs));
+            return;
         }
         else {
             // Block is either okay, or possibly we received
@@ -3548,14 +3549,16 @@ static bool SendRejectsAndCheckIfBanned(const CNodePtr& pnode, CConnman &connman
     if (state->fShouldBan) {
         state->fShouldBan = false;
         const CAddress& peerAddr { pnode->GetAssociation().GetPeerAddr() };
+        pnode->fDisconnect = true;
         if (pnode->fWhitelisted) {
-            LogPrintf("Warning: not punishing whitelisted peer %s!\n",
-                      peerAddr.ToString());
+            LogPrintf(
+                "Warning: disconnecting but not banning whitelisted peer %s!\n",
+                peerAddr.ToString());
         } else if (pnode->fAddnode) {
-            LogPrintf("Warning: not punishing addnoded peer %s!\n",
-                      peerAddr.ToString());
+            LogPrintf(
+                "Warning: disconnecting but not banning addnoded peer %s!\n",
+                peerAddr.ToString());
         } else {
-            pnode->fDisconnect = true;
             if (peerAddr.IsLocal()) {
                 LogPrintf("Warning: not banning local peer %s!\n",
                           peerAddr.ToString());
@@ -4319,15 +4322,15 @@ void SendFeeFilter(const Config &config, const CNodePtr& pto, CConnman& connman,
         int64_t timeNow = GetTimeMicros();
         if (timeNow > pto->nextSendTimeFeeFilter) {
             static CFeeRate default_feerate =
-                CFeeRate(DEFAULT_MIN_RELAY_TX_FEE);
+                CFeeRate(DEFAULT_MEMPOOL_MIN_FEE_RATE);
             static FeeFilterRounder filterRounder(default_feerate);
             Amount filterToSend = filterRounder.round(currentFilter);
-            // If we don't allow free transactions, then we always have a fee
-            // filter of at least minRelayTxFee
-            if (config.GetLimitFreeRelay() <= 0) {
-                filterToSend = std::max(filterToSend,
-                                        config.GetMinFeePerKB().GetFeePerK());
-            }
+            // Never advertise below the current (dynamic) mempool admission
+            // feerate: rounding can bucket filterToSend down past the live
+            // floor, which would let peers waste bandwidth relaying txns we
+            // would now reject. currentFilter is already GetMinFee(), so this
+            // tracks the ramp instead of the static configured floor.
+            filterToSend = std::max(filterToSend, currentFilter);
 
             if (filterToSend != pto->lastSentFeeFilter) {
                 connman.PushMessage(

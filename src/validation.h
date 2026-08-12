@@ -79,8 +79,6 @@ static const bool DEFAULT_WHITELISTRELAY = true;
 static const bool DEFAULT_WHITELISTFORCERELAY = true;
 /** Default for DEFAULT_REJECTMEMPOOLREQUEST. */
 static const bool DEFAULT_REJECTMEMPOOLREQUEST = false;
-/** Default for -minrelaytxfee, minimum relay fee for transactions */
-static constexpr Amount DEFAULT_MIN_RELAY_TX_FEE(60);
 //! -maxtxfee default
 static const Amount DEFAULT_TRANSACTION_MAXFEE(COIN / 10);
 //! Discourage users to set fees higher than this amount (in satoshis) per kB
@@ -88,16 +86,8 @@ static const Amount HIGH_TX_FEE_PER_KB(COIN / 100);
 /** -maxtxfee will warn if called with a higher fee than this amount (in
  * satoshis */
 static const Amount HIGH_MAX_TX_FEE(100 * HIGH_TX_FEE_PER_KB);
-/** Default for -limitancestorcount, max number of in-mempool ancestors */
+/** Default for -limitancestorcount, max in-mempool ancestor chain height. */
 static const uint64_t DEFAULT_ANCESTOR_LIMIT = 10000;
-/** Default for -limitdescendantcount, max number of in-mempool descendants */
-static const uint64_t DEFAULT_DESCENDANT_LIMIT = 10000;
-/** Default for -limitancestorsize, maximum kilobytes of tx + all in-mempool
- * ancestors */
-static const uint64_t DEFAULT_ANCESTOR_SIZE_LIMIT = DEFAULT_ANCESTOR_LIMIT * MAX_TX_SIZE_CONSENSUS_BEFORE_GENESIS;
-/** Default for -limitdescendantsize, maximum kilobytes of in-mempool
- * descendants */
-static const uint64_t DEFAULT_DESCENDANT_SIZE_LIMIT = DEFAULT_DESCENDANT_LIMIT * MAX_TX_SIZE_CONSENSUS_BEFORE_GENESIS;
 /** Default for -mempoolexpiry, expiration time for mempool transactions in
  * hours */
 static const unsigned int DEFAULT_MEMPOOL_EXPIRY = 336;
@@ -183,8 +173,6 @@ static const int64_t BLOCK_DOWNLOAD_TIMEOUT_BASE = 1000000;
  */
 static const int64_t BLOCK_DOWNLOAD_TIMEOUT_PER_PEER = 500000;
 
-static const unsigned int DEFAULT_LIMITFREERELAY = 0;
-static const bool DEFAULT_RELAYPRIORITY = true;
 static const int64_t DEFAULT_MAX_TIP_AGE = 24 * 60 * 60;
 
 /** Default for -permitbaremultisig */
@@ -673,13 +661,17 @@ size_t GetNumLowPriorityValidationThrs(size_t nTestingHCValue=SIZE_MAX);
 size_t GetNumHighPriorityValidationThrs(size_t nTestingHCValue=SIZE_MAX);
 
 /**
- * Limit mempool size.
+ * Expire transactions that have aged past the mempool expiry window.
+ *
+ * Under the no-trim policy, this function does not enforce the N2 threshold.
+ * TxnValidation rejects new transactions before insertion once current dynamic
+ * memory usage reaches GetMaxMempool().
  *
  * @param pool A reference to the mempool
- * @param changeSet A reference to the Jorunal ChangeSet
- * @param limit A size limit for txn to remove
- * @param age Time limit for txn to remove
- * @return A vector with all TxIds which were removed from the mempool
+ * @param changeSet A reference to the Journal ChangeSet
+ * @param limit Unused legacy size-limit parameter
+ * @param age Maximum transaction age
+ * @return An empty vector; expiry removals are not reported by TxId
  */
 std::vector<TxId> LimitMempoolSize(
     CTxMemPool &pool,
@@ -697,7 +689,7 @@ std::vector<TxId> LimitMempoolSize(
  * @param pool A reference to the mempool
  * @param state A reference to a state variable
  * @param changeSet A reference to the Jorunal ChangeSet
- * @param fLimitMempoolSize A flag to limit a mempool size
+ * @param fLimitMempoolSize A flag to run mempool expiry cleanup after commit
  * @param pnMempoolSize If not null store mempool size after txn is commited
  * @param pnDynamicMemoryUsage If not null store dynamic memory usage after txn is commited
  */
@@ -772,7 +764,7 @@ std::vector<std::pair<CTxnValResult, CTask::Status>> TxnValidationProcessingTask
  * @param pool A reference to the mempool
  * @param txStatus A result of validation
  * @param handlers Txn handlers
- * @param fLimitMempoolSize A flag to limit a mempool size
+ * @param fLimitMempoolSize A flag to run mempool expiry cleanup after commit
  */
 void ProcessValidatedTxn(
     CTxMemPool& pool,
@@ -869,8 +861,6 @@ void UpdateCoins(const CTransaction &tx, CCoinsViewCache &inputs,
 
 /** Context-independent validity checks for coinbase and non-coinbase transactions */
 bool CheckRegularTransaction(const CTransaction &tx, CValidationState &state, uint64_t maxTxSigOpsCountConsensusBeforeGenesis, uint64_t maxTxSizeConsensus, bool isGenesisEnabled);
-
-void HeightFormScript(const CTransaction& tx,uint64_t &scriptSigHeight);
 
 bool CheckCoinbase(const CTransaction &tx, CValidationState &state, uint64_t maxTxSigOpsCountConsensusBeforeGenesis, uint64_t maxTxSizeConsensus, bool isGenesisEnabled, const uint256& prevBlockHash, int blockHeight = -1);
 

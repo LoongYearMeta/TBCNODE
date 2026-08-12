@@ -15,8 +15,6 @@ GlobalConfig::GlobalConfig() {
 
 void GlobalConfig::Reset()
 {
-    feePerKB = CFeeRate {};
-    blockMinFeePerKB = CFeeRate{DEFAULT_BLOCK_MIN_TX_FEE};
     blockPriorityPercentage = DEFAULT_BLOCK_PRIORITY_PERCENTAGE;
     preferredBlockFileSize = DEFAULT_PREFERRED_BLOCKFILE_SIZE;
     factorMaxSendQueuesBytes = DEFAULT_FACTOR_MAX_SEND_QUEUES_BYTES;
@@ -36,10 +34,7 @@ void GlobalConfig::Reset()
     acceptNonStdConsolidationInput = DEFAULT_ACCEPT_NON_STD_CONSOLIDATION_INPUT;
 
     dataCarrierSize = DEFAULT_DATA_CARRIER_SIZE;
-    limitDescendantCount = DEFAULT_DESCENDANT_LIMIT;
     limitAncestorCount = DEFAULT_ANCESTOR_LIMIT;
-    limitDescendantSize = DEFAULT_DESCENDANT_SIZE_LIMIT;
-    limitAncestorSize = DEFAULT_ANCESTOR_SIZE_LIMIT;
 
     testBlockCandidateValidity = false;
     blockAssemblerType = mining::DEFAULT_BLOCK_ASSEMBLER_TYPE;
@@ -75,7 +70,8 @@ void GlobalConfig::Reset()
     
     mMaxMempool = DEFAULT_MAX_MEMPOOL_SIZE * ONE_MEGABYTE;
     mMemPoolExpiry = DEFAULT_MEMPOOL_EXPIRY * SECONDS_IN_ONE_HOUR;
-    mLimitFreeRelay = DEFAULT_LIMITFREERELAY * ONE_KILOBYTE;
+    mMempoolFeeRampStart = DEFAULT_MEMPOOL_FEE_RAMP_START * ONE_MEGABYTE;
+    mMempoolMinFeePerKB = CFeeRate(DEFAULT_MEMPOOL_MIN_FEE_RATE);
     mMaxOrphanTxSize = COrphanTxns::DEFAULT_MAX_ORPHAN_TRANSACTIONS_SIZE;
     mStopAtHeight = DEFAULT_STOPATHEIGHT;
     mPromiscuousMempoolFlags = 0;
@@ -328,36 +324,12 @@ uint64_t GlobalConfig::GetDataCarrierSize() const {
     return dataCarrierSize;
 }
 
-void GlobalConfig::SetLimitAncestorSize(uint64_t limitAncestorSizeIn) {
-    limitAncestorSize = limitAncestorSizeIn;
-}
-
-uint64_t GlobalConfig::GetLimitAncestorSize() const {
-    return limitAncestorSize;
-}
-
-void GlobalConfig::SetLimitDescendantSize(uint64_t limitDescendantSizeIn) {
-    limitDescendantSize = limitDescendantSizeIn;
-}
-
-uint64_t GlobalConfig::GetLimitDescendantSize() const {
-    return limitDescendantSize;
-}
-
 void GlobalConfig::SetLimitAncestorCount(uint64_t limitAncestorCountIn) {
     limitAncestorCount = limitAncestorCountIn;
 }
 
 uint64_t GlobalConfig::GetLimitAncestorCount() const {
     return limitAncestorCount;
-}
-
-void GlobalConfig::SetLimitDescendantCount(uint64_t limitDescendantCountIn) {
-    limitDescendantCount = limitDescendantCountIn;
-}
-
-uint64_t GlobalConfig::GetLimitDescendantCount() const {
-    return limitDescendantCount;
 }
 
 const CChainParams &GlobalConfig::GetChainParams() const {
@@ -921,22 +893,6 @@ int DummyConfig::GetPerBlockScriptValidationMaxBatchSize() const
     return DEFAULT_SCRIPT_CHECK_MAX_BATCH_SIZE;
 }
 
-void GlobalConfig::SetMinFeePerKB(CFeeRate fee) {
-    feePerKB = fee;
-}
-
-CFeeRate GlobalConfig::GetMinFeePerKB() const {
-    return feePerKB;
-}
-
-void GlobalConfig::SetBlockMinFeePerKB(CFeeRate fee) {
-    blockMinFeePerKB = fee;
-}
-
-CFeeRate GlobalConfig::GetBlockMinFeePerKB() const {
-    return blockMinFeePerKB;
-}
-
 bool GlobalConfig::SetMaxTxSigOpsCountPolicy(int64_t maxTxSigOpsCountIn, std::string* err)
 {
     if (LessThanZero(maxTxSigOpsCountIn, err, "Policy value for maximum allowed number of signature operations per transaction cannot be less than 0"))
@@ -1052,19 +1008,45 @@ uint64_t GlobalConfig::GetMemPoolExpiry() const {
     return mMemPoolExpiry;
 }
 
-bool GlobalConfig::SetLimitFreeRelay(int64_t limitFreeRelay, std::string* err) {
-    if (LessThanZero(limitFreeRelay, err, "Policy value for rate-limit free transactions must not be less than 0."))
+bool GlobalConfig::SetMempoolFeeRampStart(int64_t rampStart, std::string* err) {
+    if (LessThanZero(rampStart, err, "Policy value for mempool fee ramp start must not be less than 0."))
     {
         return false;
     }
 
-    mLimitFreeRelay = static_cast<uint64_t>(limitFreeRelay);
+    mMempoolFeeRampStart = static_cast<uint64_t>(rampStart);
 
     return true;
 }
 
-uint64_t GlobalConfig::GetLimitFreeRelay() const {
-    return mLimitFreeRelay;
+uint64_t GlobalConfig::GetMempoolFeeRampStart() const {
+    return mMempoolFeeRampStart;
+}
+
+bool GlobalConfig::SetMempoolMinFeePerKB(int64_t feePerKB, std::string* err) {
+    if (LessThanZero(feePerKB, err, "Policy value for mempool minimum feerate must not be less than 0."))
+    {
+        return false;
+    }
+
+    if (feePerKB > MAX_MEMPOOL_RAMP_FEE_RATE.GetSatoshis()) {
+        if (err) {
+            *err = "Policy value for mempool minimum feerate must not exceed "
+                   "the maximum mempool ramp feerate of " +
+                   std::to_string(
+                       MAX_MEMPOOL_RAMP_FEE_RATE.GetSatoshis()) +
+                   ".";
+        }
+        return false;
+    }
+
+    mMempoolMinFeePerKB = CFeeRate(Amount(feePerKB));
+
+    return true;
+}
+
+CFeeRate GlobalConfig::GetMempoolMinFeePerKB() const {
+    return mMempoolMinFeePerKB;
 }
 
 bool GlobalConfig::SetMaxOrphanTxSize(int64_t maxOrphanTxSize, std::string* err) {

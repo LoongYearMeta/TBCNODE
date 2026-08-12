@@ -145,9 +145,6 @@ void getrawtransaction(const Config& config,
                        bool processedInBatch,
                        std::function<void()> httpCallback) 
 {
-    
-    LOCK(cs_main);
-
     TxId txid = TxId(ParseHashV(request.params[0], "parameter 1"));
 
     // Accept either a bool (true) or a num (>=1) to indicate verbose output.
@@ -179,7 +176,21 @@ void getrawtransaction(const Config& config,
     CTransactionRef tx;
     uint256 hashBlock;
     bool isGenesisEnabled;
-    if (!GetTransaction(config, txid, tx, true, hashBlock, isGenesisEnabled)) 
+
+    // A non-verbose response only needs the immutable transaction data. Try
+    // the mempool first so this common path does not have to take cs_main.
+    // Get() releases the mempool lock before returning and the shared
+    // transaction reference keeps the transaction alive while it is encoded.
+    if (!fVerbose)
+    {
+        tx = mempool.Get(txid);
+    }
+
+    // Query the mempool again inside GetTransaction after a miss: the
+    // transaction may have been added between the cs_main-free fast-path
+    // lookup and acquiring cs_main.
+    if (!tx &&
+        !GetTransaction(config, txid, tx, true, hashBlock, isGenesisEnabled))
     {
         throw JSONRPCError(
             RPC_INVALID_ADDRESS_OR_KEY,
@@ -201,6 +212,8 @@ void getrawtransaction(const Config& config,
         textWriter.Write("\", \"error\": " + NullUniValue.write() + ", \"id\": " + request.id.write() + "}");
         return;
     }
+
+    LOCK(cs_main);
 
     textWriter.Write("{\"result\": ");
 
@@ -1214,7 +1227,7 @@ static UniValue sendrawtransaction(const Config &config,
                     false,         // fLimitFree
                     nMaxRawTxFee), // nAbsurdFee
                 changeSet, // an instance of the journal
-                true) // fLimitMempoolSize
+                true) // run mempool expiry cleanup
         };
         // Check if the transaction was accepted by the mempool.
         // Due to potential race-condition we have to explicitly call exists() instead of
@@ -1489,7 +1502,7 @@ static UniValue sendrawtransactions(const Config &config,
             txValidator->processValidation(
                 vTxInputData, // A vector of txns that need to be processed
                 changeSet, // an instance of the journal
-                true); // fLimitMempoolSize
+                true); // run mempool expiry cleanup
     }
 
     /**
@@ -1510,9 +1523,8 @@ static UniValue sendrawtransactions(const Config &config,
             else if(mempool.getNonFinalPool().exists(txid)) {
                 txinfo = mempool.getNonFinalPool().getInfo(txid);
             }
-            // It is possible that txn was added and removed from the mempool, because:
-            // - a block was mined
-            // - PTV's asynch mode removed txn(s)
+            // A transaction accepted above may already have been mined before
+            // its mempool information is collected here.
             if (txinfo.tx != nullptr){
                 g_connman->EnqueueTransaction({ inv, txinfo });
             }
@@ -1532,13 +1544,14 @@ static UniValue sendrawtransactions(const Config &config,
      * 2. txid of an invalid transaction, including validation state information:
      *   - reject code
      *   - reject reason
-     * 3. txid of a transaction evicted from the mempool during processing:
-     *   - txn which was accepted and then removed due to insufficient fee
+     *
+     * Size-cap failures are rejected by TxnValidation before insertion and are
+     * therefore returned as invalid transactions with reason "mempool full".
+     * The no-trim policy does not evict accepted transactions to enforce size.
      *
      * Accepted txids are not returned in the result set, as it could create false-positives,
      * for accepted txns, if:
      * - a block was mined
-     * - PTV's asynch mode removed txn(s)
      * From the user's perspective, It could cause a misinterpretation.
      *
      * If the result set is empty, then all transactions are valid, and most likely,

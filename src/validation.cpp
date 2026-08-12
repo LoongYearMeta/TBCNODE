@@ -20,6 +20,7 @@
 #include "fs.h"
 #include "hash.h"
 #include "init.h"
+#include "logging.h"
 #include "mining/journal_builder.h"
 #include "net/net.h"
 #include "net/net_processing.h"
@@ -30,6 +31,7 @@
 #include "primitives/block.h"
 #include "primitives/transaction.h"
 #include "random.h"
+#include "script/int_serialization.h"
 #include "script/scriptcache.h"
 #include "script/sigcache.h"
 #include "script/standard.h"
@@ -50,12 +52,12 @@
 #include "versionbits.h"
 #include "warnings.h"
 #include "blockfileinfostore.h"
-#include "time_consuming.h"
 #include "script/script_num.h"
 #include "key.h"
 #include "pubkey.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -83,8 +85,6 @@ using namespace boost::placeholders;
 
 #define TBC_FORK_BLOCK_HEIGHT 824190
 
-// Used for block production testing
-bool gBlockProductionTest = false;
 
 /**
  * Global state
@@ -659,140 +659,303 @@ uint64_t vectorLEtoU64(const vector<uint8_t>& bytes) {
     return res;
 }
 
+namespace {
+
+constexpr size_t MAX_COINBASE_HEIGHT_SIZE = 5;
+constexpr size_t MINER_BILL_V2_SCRIPT_PREFIX_SIZE = 28;
+constexpr size_t MINER_BILL_V2_FIXED_PAYLOAD_SIZE = 103;
+constexpr size_t MINER_BILL_V2_MIN_PERMISSION_HEIGHT_SIZE = 1;
+constexpr size_t MINER_BILL_V2_MAX_PERMISSION_HEIGHT_SIZE =
+    sizeof(uint64_t);
+
+struct CoinbaseHeightPrefix {
+    uint64_t height{0};
+    std::array<uint8_t, MAX_COINBASE_HEIGHT_SIZE> encodedHeight{};
+    size_t encodedHeightSize{0};
+    size_t nextOffset{0};
+};
+
+struct MinerBillV2ScriptData {
+    bool isFixedChangeAddress{false};
+    std::vector<uint8_t> chargeAddressPubkeyHash;
+    std::vector<uint8_t> pubkeyMiner;
+    std::vector<uint8_t> sigManager;
+    std::vector<uint8_t> permissionHeight;
+    std::vector<uint8_t> chargeRate;
+    std::vector<uint8_t> countryCode;
+};
+
+bool ParseCanonicalMinerBillV2Script(
+    const CScript& script,
+    MinerBillV2ScriptData& result) {
+    result = {};
+
+    const size_t minimumScriptSize =
+        MINER_BILL_V2_SCRIPT_PREFIX_SIZE +
+        MINER_BILL_V2_FIXED_PAYLOAD_SIZE +
+        MINER_BILL_V2_MIN_PERMISSION_HEIGHT_SIZE;
+    if (script.size() < minimumScriptSize ||
+        script[0] != OP_DUP ||
+        script[1] != OP_HASH160 ||
+        script[2] != 20 ||
+        script[23] != OP_EQUALVERIFY ||
+        script[24] != OP_CHECKSIG ||
+        script[25] != OP_RETURN ||
+        script[26] != OP_PUSHDATA1) {
+        return false;
+    }
+
+    const size_t payloadSize = script[27];
+    if (script.size() != MINER_BILL_V2_SCRIPT_PREFIX_SIZE + payloadSize) {
+        return false;
+    }
+
+    size_t index = MINER_BILL_V2_SCRIPT_PREFIX_SIZE;
+    const auto readBytes = [&script, &index](
+                               size_t length,
+                               std::vector<uint8_t>& destination) {
+        if (length > script.size() - index) {
+            return false;
+        }
+        destination.assign(
+            script.begin() + index, script.begin() + index + length);
+        index += length;
+        return true;
+    };
+
+    const uint8_t fixedChangeAddress = script[index++];
+    if (fixedChangeAddress > 1) {
+        return false;
+    }
+    result.isFixedChangeAddress = fixedChangeAddress == 1;
+    result.chargeAddressPubkeyHash.assign(
+        script.begin() + 3, script.begin() + 23);
+
+    if (!readBytes(32, result.pubkeyMiner) ||
+        !readBytes(64, result.sigManager)) {
+        return false;
+    }
+
+    const size_t permissionHeightSize = script[index++];
+    if (permissionHeightSize < MINER_BILL_V2_MIN_PERMISSION_HEIGHT_SIZE ||
+        permissionHeightSize > MINER_BILL_V2_MAX_PERMISSION_HEIGHT_SIZE ||
+        payloadSize !=
+            MINER_BILL_V2_FIXED_PAYLOAD_SIZE + permissionHeightSize) {
+        return false;
+    }
+
+    if (!readBytes(permissionHeightSize, result.permissionHeight) ||
+        !readBytes(1, result.chargeRate) ||
+        !readBytes(4, result.countryCode)) {
+        return false;
+    }
+
+    return index == script.size();
+}
+
+bool ParseCoinbaseHeightPrefix(
+    const CScript& coinbaseInputScript,
+    CoinbaseHeightPrefix& result) noexcept {
+    result = {};
+    if (coinbaseInputScript.empty()) {
+        return false;
+    }
+
+    const uint8_t opcode = coinbaseInputScript[0];
+    if (opcode == OP_0) {
+        result.nextOffset = 1;
+        return true;
+    }
+
+    if (opcode >= OP_1 && opcode <= OP_16) {
+        result.height = opcode - OP_1 + 1;
+        result.encodedHeight[0] = static_cast<uint8_t>(result.height);
+        result.encodedHeightSize = 1;
+        result.nextOffset = 1;
+        return true;
+    }
+
+    // BIP34 heights are minimally encoded script numbers. A non-negative
+    // height needs at most five bytes, all of which use a direct data push.
+    const size_t heightSize = opcode;
+    if (heightSize == 0 || heightSize > MAX_COINBASE_HEIGHT_SIZE ||
+        heightSize > coinbaseInputScript.size() - 1) {
+        return false;
+    }
+
+    for (size_t i = 0; i < heightSize; ++i) {
+        result.encodedHeight[i] = coinbaseInputScript[i + 1];
+    }
+
+    const bsv::span<const uint8_t> encodedHeight{
+        result.encodedHeight.data(), heightSize};
+    if (!bsv::IsMinimallyEncoded(
+            encodedHeight, MAX_COINBASE_HEIGHT_SIZE)) {
+        return false;
+    }
+
+    // A one-byte number in this range must use OP_1NEGATE/OP_1..OP_16
+    // instead of a one-byte data push.
+    if (heightSize == 1 &&
+        (result.encodedHeight[0] == 0x81 ||
+         (result.encodedHeight[0] >= 1 &&
+          result.encodedHeight[0] <= 16))) {
+        return false;
+    }
+
+    // Block heights are non-negative. In CScriptNum the top bit is the sign.
+    if ((result.encodedHeight[heightSize - 1] & 0x80) != 0) {
+        return false;
+    }
+
+    for (size_t i = 0; i < heightSize; ++i) {
+        result.height |=
+            static_cast<uint64_t>(result.encodedHeight[i]) << (8 * i);
+    }
+    result.encodedHeightSize = heightSize;
+    result.nextOffset = 1 + heightSize;
+    return true;
+}
+
+} // namespace
+
 bool FilledMinerBillV2(const CTransaction& tx, const uint256 tipBlockHash) {
-    if (tx.vin.empty() || tx.vout.empty()) { return false; }
-    // Script data.
-    const CScript &chargeOutputScript = tx.vout[0].scriptPubKey;
-    const CScript &chargeInputScript = tx.vin[0].scriptSig;
-    if (chargeInputScript.empty() || chargeOutputScript.empty()) { return false; }
-    uint64_t inputScriptIndex = 0;
-    uint64_t outputScriptIndex = 0;
-    std::vector<XOnlyPubKey> pubkeyManagerArr;
-    XOnlyPubKey pubkeyMiner;
-    std::vector<uint8_t> pubkeyMinerVec;
-    std::vector<uint8_t> sigManagerVec;
-    std::vector<uint8_t> sigMinerVec;
-    std::vector<uint8_t> isfixedChangeAddressVec;
-    bool isFixedChangeAddress = false;
-    std::vector<uint8_t> chargeAddressPubkeyHashVec;
-    std::vector<uint8_t> kycChargeRateVec;
-    std::vector<uint8_t> actualChargeRateVec;
-    uint64_t kycChargeRate;
-    std::vector<uint8_t> permissionHeightLengthVec;
-    std::vector<uint8_t> currentChainHeightLengthVec;
-    std::vector<uint8_t> kycPermissionHeightVec;
-    std::vector<uint8_t> currentChainHeightVec;
-    unsigned int permissionHeightLength;
-    unsigned int currentChainHeightLength;
-    unsigned int kycPermissionHeight;
-    unsigned int currentChainHeight;
-    std::vector<uint8_t> msgManager;
-    std::vector<uint8_t> msgMiner;
-    uint256 msgHashManager;
-    uint256 msgHashMiner;
-    std::vector<uint8_t> countryCodeVec;
-
-    // Get pukeyManagerArr from hard code
-    if (!gBlockProductionTest) {
-        pubkeyManagerArr.push_back(XOnlyPubKey(ParseHex("84ddaab460c3e2d460a5c706746d3894928cfcac87a41840e1e5992ebf047b49")));
-        pubkeyManagerArr.push_back(XOnlyPubKey(ParseHex("f54e6c6619cfd2c2b62ce17fa0366b8a69ee0d97a4d9752e7286b71530dbf02e")));
-    }
-    else{
-        LogPrintf("=============== Block production test mode: using test manager public key ===============\n");
-        pubkeyManagerArr.push_back(XOnlyPubKey(ParseHex("b44895b362dac31d35cf8cda5385db2cc254ac31892e7cd9cac6447c039f0a18")));
+    if (tx.vin.empty() || tx.vout.empty()) {
+        return false;
     }
 
-    // Get date from Output Scirpt
-    outputScriptIndex += 28;    // Skip P2PKH + op_return + op_pushdata + dataLength(25 + 1 + 1 + 1)
-    if (!safeReadScript(chargeOutputScript, outputScriptIndex, 1, isfixedChangeAddressVec)) { return false; }
-    if (isfixedChangeAddressVec[0] == 0x01) {
-        isFixedChangeAddress = true;
+    const CScript& chargeOutputScript = tx.vout[0].scriptPubKey;
+    const CScript& chargeInputScript = tx.vin[0].scriptSig;
+    if (chargeInputScript.empty() || chargeOutputScript.empty()) {
+        return false;
     }
-    if (!safeReadScript(chargeOutputScript, outputScriptIndex, 32, pubkeyMinerVec)) { return false; }
-    pubkeyMiner = XOnlyPubKey(pubkeyMinerVec);
-    if (!safeReadScript(chargeOutputScript, outputScriptIndex, 64, sigManagerVec)) { return false; }
-    if (!safeReadScript(chargeOutputScript, outputScriptIndex, 1, permissionHeightLengthVec)) { return false; }
-    permissionHeightLength = vectorLEtoU64(permissionHeightLengthVec);
-    if (!safeReadScript(chargeOutputScript, outputScriptIndex, permissionHeightLength, kycPermissionHeightVec)) { return false; }
-    kycPermissionHeight = vectorLEtoU64(kycPermissionHeightVec);
-    if (!safeReadScript(chargeOutputScript, outputScriptIndex, 1, kycChargeRateVec)) { return false; }
-    kycChargeRate = vectorLEtoU64(kycChargeRateVec);
-    if (!safeReadScript(chargeOutputScript, outputScriptIndex, 4, countryCodeVec)) { return false; }
-    
-    // Get data from Input Script
-    if (!safeReadScript(chargeInputScript, inputScriptIndex, 1, currentChainHeightLengthVec)) { return false; }
-    currentChainHeightLength = vectorLEtoU64(currentChainHeightLengthVec);
-    if (!safeReadScript(chargeInputScript, inputScriptIndex, currentChainHeightLength, currentChainHeightVec)) { return false; }
-    currentChainHeight = vectorLEtoU64(currentChainHeightVec);
-    if (!safeReadScript(chargeInputScript, inputScriptIndex, 64, sigMinerVec)) { return false; }
 
-    // Check kyc permission height
+    MinerBillV2ScriptData minerBill;
+    if (!ParseCanonicalMinerBillV2Script(chargeOutputScript, minerBill)) {
+        return false;
+    }
+
+    CoinbaseHeightPrefix coinbaseHeight;
+    if (!ParseCoinbaseHeightPrefix(chargeInputScript, coinbaseHeight)) {
+        return false;
+    }
+
+    uint64_t inputScriptIndex = coinbaseHeight.nextOffset;
+    std::vector<uint8_t> sigMiner;
+    if (!safeReadScript(
+            chargeInputScript, inputScriptIndex, 64, sigMiner)) {
+        return false;
+    }
+
+    const uint64_t currentChainHeight = coinbaseHeight.height;
+    const uint64_t kycPermissionHeight =
+        vectorLEtoU64(minerBill.permissionHeight);
     if (kycPermissionHeight < currentChainHeight) {
-        LogPrintf("KYC permission Height is less than current chain height !!! (%d < %d) \n", kycPermissionHeight, currentChainHeight);
+        LogPrintf(
+            "KYC permission Height is less than current chain height !!! "
+            "(%d < %d) \n",
+            kycPermissionHeight, currentChainHeight);
         return false;
     }
 
-    // check kyc charge rate
-    uint64_t totalOutputValue = tx.GetValueOut().GetSatoshis();
+    const uint64_t kycChargeRate = vectorLEtoU64(minerBill.chargeRate);
+    const uint64_t totalOutputValue = tx.GetValueOut().GetSatoshis();
     if (totalOutputValue == 0) {
-        LogPrintf("Total output value is zero, cannot calculate charge rate\n");
+        LogPrintf(
+            "Total output value is zero, cannot calculate charge rate\n");
         return false;
     }
-    uint64_t chargeValueLimit = totalOutputValue * kycChargeRate / 100;
-    uint64_t chargeValue = tx.vout[0].nValue.GetSatoshis();
+    const uint64_t chargeValueLimit =
+        totalOutputValue * kycChargeRate / 100;
+    const uint64_t chargeValue = tx.vout[0].nValue.GetSatoshis();
     if (chargeValue < chargeValueLimit) {
-        LogPrintf("Charge value is less than charge value limit !!! (%d < %d) \n", chargeValue, chargeValueLimit);
+        LogPrintf(
+            "Charge value is less than charge value limit !!! (%d < %d) \n",
+            chargeValue, chargeValueLimit);
         return false;
     }
 
-    // Compute message hash
-    msgMiner.insert(msgMiner.end(), pubkeyMinerVec.begin(), pubkeyMinerVec.end());
-    msgMiner.insert(msgMiner.end(), currentChainHeightVec.begin(), currentChainHeightVec.end());
-    // Use uint256.GetHex() to get the big-endian block hash
-    std::vector<uint8_t> tipBlockHashVec = ParseHex(tipBlockHash.GetHex());
-    msgMiner.insert(msgMiner.end(), tipBlockHashVec.begin(), tipBlockHashVec.end());
-    msgHashMiner = Hash(msgMiner.begin(), msgMiner.end());
-    
-    msgManager.insert(msgManager.end(), pubkeyMinerVec.begin(), pubkeyMinerVec.end());
-    msgManager.insert(msgManager.end(), kycPermissionHeightVec.begin(), kycPermissionHeightVec.end());
-    msgManager.insert(msgManager.end(), kycChargeRateVec.begin(), kycChargeRateVec.end());
-    msgManager.insert(msgManager.end(), countryCodeVec.begin(), countryCodeVec.end());
-    if (isFixedChangeAddress == true) {
-        uint64_t chargeAddressIndex = 3;
-        if (!safeReadScript(chargeOutputScript, chargeAddressIndex, 20, chargeAddressPubkeyHashVec)) { return false; }
-        msgManager.insert(msgManager.end(), chargeAddressPubkeyHashVec.begin(), chargeAddressPubkeyHashVec.end());
+    std::vector<uint8_t> currentChainHeightBytes(
+        coinbaseHeight.encodedHeight.begin(),
+        coinbaseHeight.encodedHeight.begin() +
+            coinbaseHeight.encodedHeightSize);
+    std::vector<uint8_t> msgMiner;
+    msgMiner.insert(
+        msgMiner.end(), minerBill.pubkeyMiner.begin(),
+        minerBill.pubkeyMiner.end());
+    msgMiner.insert(
+        msgMiner.end(), currentChainHeightBytes.begin(),
+        currentChainHeightBytes.end());
+    const std::vector<uint8_t> tipBlockHashBytes =
+        ParseHex(tipBlockHash.GetHex());
+    msgMiner.insert(
+        msgMiner.end(), tipBlockHashBytes.begin(), tipBlockHashBytes.end());
+    const uint256 msgHashMiner = Hash(msgMiner.begin(), msgMiner.end());
+
+    std::vector<uint8_t> msgManager;
+    msgManager.insert(
+        msgManager.end(), minerBill.pubkeyMiner.begin(),
+        minerBill.pubkeyMiner.end());
+    msgManager.insert(
+        msgManager.end(), minerBill.permissionHeight.begin(),
+        minerBill.permissionHeight.end());
+    msgManager.insert(
+        msgManager.end(), minerBill.chargeRate.begin(),
+        minerBill.chargeRate.end());
+    msgManager.insert(
+        msgManager.end(), minerBill.countryCode.begin(),
+        minerBill.countryCode.end());
+    if (minerBill.isFixedChangeAddress) {
+        msgManager.insert(
+            msgManager.end(), minerBill.chargeAddressPubkeyHash.begin(),
+            minerBill.chargeAddressPubkeyHash.end());
     }
-    msgHashManager = Hash(msgManager.begin(), msgManager.end());
-    
-    // Verify miner signature
-    if (!pubkeyMiner.VerifySchnorr(msgHashMiner, sigMinerVec)) {
+    const uint256 msgHashManager =
+        Hash(msgManager.begin(), msgManager.end());
+
+    const XOnlyPubKey pubkeyMiner(minerBill.pubkeyMiner);
+    if (!pubkeyMiner.VerifySchnorr(msgHashMiner, sigMiner)) {
         LogPrintf("Miner signature verification failed !!! \n");
         return false;
     }
-    // Verify if fit one of the manager public key.
-    bool ret = false;
-    for (auto pubkeyManager : pubkeyManagerArr) {
-        if (pubkeyManager.VerifySchnorr(msgHashManager, sigManagerVec)) {
-            ret = true;
-            break;
+
+    std::vector<XOnlyPubKey> pubkeyManagers;
+    
+    pubkeyManagers.emplace_back(ParseHex(
+        "84ddaab460c3e2d460a5c706746d3894928cfcac87a41840e1e5992ebf047b49"));
+    pubkeyManagers.emplace_back(ParseHex(
+        "f54e6c6619cfd2c2b62ce17fa0366b8a69ee0d97a4d9752e7286b71530dbf02e"));
+
+
+    for (const auto& pubkeyManager : pubkeyManagers) {
+        if (pubkeyManager.VerifySchnorr(
+                msgHashManager, minerBill.sigManager)) {
+            return true;
         }
     }
-    if (!ret) {
-        LogPrintf("Manager signature verification failed !!! \n");
-        return false;
-    }
 
-    return ret;
+    LogPrintf("Manager signature verification failed !!! \n");
+    return false;
 }
 
 bool FilledMinerBill(const CTransaction& tx)
 {
+    if (tx.vin.empty() || tx.vout.empty()) {
+        return false;
+    }
+
     const CScript &chargeOutputScript = tx.vout[0].scriptPubKey;
     const CScript &chargeInputScript = tx.vin[0].scriptSig;
-    uint64_t inputScriptIndex = 0;
     uint64_t outputScriptIndex = 0;
 
-    if (chargeOutputScript.empty() || chargeInputScript.empty()) throw std::runtime_error("Empty coinbase charge input/output script");
+    if (chargeOutputScript.empty() || chargeInputScript.empty()) {
+        return false;
+    }
+    CoinbaseHeightPrefix coinbaseHeight;
+    if (!ParseCoinbaseHeightPrefix(chargeInputScript, coinbaseHeight)) {
+        return false;
+    }
+    uint64_t inputScriptIndex = coinbaseHeight.nextOffset;
 
     // default pubkeyA
     std::vector<uint8_t> pubkeyA = {0x03, 0x18, 0xa2, 0x74, 0x33, 0x7b, 0x8f, 0x52, 0x72, 0x6e,
@@ -813,16 +976,10 @@ bool FilledMinerBill(const CTransaction& tx)
         ifCheckChargeAddress = true;
     }
 
-    // According to bip34, get current block height.
-    vector<uint8_t> blockHeightLengthVec;
-    if (!safeReadScript(chargeInputScript, inputScriptIndex, 1, blockHeightLengthVec)) {
-        return false;
-    }
-    uint64_t blockHeightLength = vectorLEtoU64(blockHeightLengthVec); // in fact blockHeightLengthVec.size() == 1.
-    vector<uint8_t> currentBlockHeightVec;
-    if (!safeReadScript(chargeInputScript, inputScriptIndex, blockHeightLength, currentBlockHeightVec)) {
-        return false;
-    }
+    vector<uint8_t> currentBlockHeightVec(
+        coinbaseHeight.encodedHeight.begin(),
+        coinbaseHeight.encodedHeight.begin() +
+            coinbaseHeight.encodedHeightSize);
 
     // get charge address script
     std::vector<uint8_t> chargeAddressScript;
@@ -858,14 +1015,15 @@ bool FilledMinerBill(const CTransaction& tx)
 
     // ensure permissin is still validate
     uint64_t perHeight = vectorBEtoU64(vecPermissionHeight);
-    uint64_t nowHeight = vectorLEtoU64(currentBlockHeightVec);
+    uint64_t nowHeight = coinbaseHeight.height;
 
     if (perHeight < nowHeight) {
         LogPrintf("The invoice of this block is overdue !!! (%d < %d) \n", perHeight, nowHeight);
         return false;
     }
-    else if ( perHeight - 2016 < nowHeight ) {
-        LogPrintf("The invoice of this block will be overdue in %d blocks !!!\n", perHeight-nowHeight  );
+    const uint64_t remainingPermissionBlocks = perHeight - nowHeight;
+    if (remainingPermissionBlocks < 2016) {
+        LogPrintf("The invoice of this block will be overdue in %d blocks !!!\n", remainingPermissionBlocks);
     }
 
     // ensure coinbase fees are within the permitted range. 
@@ -874,8 +1032,20 @@ bool FilledMinerBill(const CTransaction& tx)
         return false;
     }
     uint64_t minerFeeRate = vectorLEtoU64(minerFeeRateVec);
-    uint64_t lowestLimitCoinbaseFee = tx.GetValueOut().GetSatoshis() * minerFeeRate / 100;
-    uint64_t coinbaseFee =  tx.vout[0].nValue.GetSatoshis();
+    Amount totalOutputValue(0);
+    for (const auto& txout : tx.vout) {
+        if (!MoneyRange(txout.nValue)) {
+            return false;
+        }
+        totalOutputValue += txout.nValue;
+        if (!MoneyRange(totalOutputValue)) {
+            return false;
+        }
+    }
+    const uint64_t lowestLimitCoinbaseFee =
+        static_cast<uint64_t>(totalOutputValue.GetSatoshis()) * minerFeeRate / 100;
+    const uint64_t coinbaseFee =
+        static_cast<uint64_t>(tx.vout[0].nValue.GetSatoshis());
     if (coinbaseFee < lowestLimitCoinbaseFee) {
         LogPrintf("Coinbase fees are not within the permitted range.txid:%s, coinbaseFee=%ld, lowestLimitCoinbaseFee=%ld\n", tx.GetHash().ToString(), coinbaseFee, lowestLimitCoinbaseFee);
         return false;
@@ -907,6 +1077,10 @@ bool FilledMinerBill(const CTransaction& tx)
 
     CPubKey cPubkeyA(pubkeyA.begin(), pubkeyA.end());
     CPubKey cPubkeyB(pubkeyB.begin(), pubkeyB.end());
+    if (sigA.empty() || sigB.empty() ||
+        !cPubkeyA.IsFullyValid() || !cPubkeyB.IsFullyValid()) {
+        return false;
+    }
 
     // get message and hash
     std::reverse(currentBlockHeightVec.begin(), currentBlockHeightVec.end());
@@ -945,98 +1119,20 @@ bool FilledMinerBill(const CTransaction& tx)
     return false;
 }
 
-void HeightFormScript(const CTransaction& tx,uint64_t &scriptSigHeight)
-{
-    if (tx.vin.empty()) {
-        throw std::runtime_error("Empty vin in transaction when parsing coinbase scriptSig");
-    }
-    const CScript &coinbaseInputScript = tx.vin[0].scriptSig;
-    if (coinbaseInputScript.size() < 1) {
-        std::stringstream error_message;
-        error_message << "the coinbase signature script for blocks of version 2 or greater must start with the length of the serialized block height";
-        throw std::runtime_error(error_message.str());
-    }
-
-    uint8_t numlen = coinbaseInputScript[0];
-    // Get length of height number
-    if (coinbaseInputScript.empty()) {
-        throw std::runtime_error("Empty coinbase scriptSig");
-    }
-    // Parse height as CScriptNum
-    if (numlen == OP_0){
-        scriptSigHeight = 0;
-    }
-    else if ((numlen >= OP_1) && (numlen <= OP_16)){
-        scriptSigHeight = numlen - OP_1 + 1;
-    }
-    else{
-        if (coinbaseInputScript.size() - 1 < (uint64_t)numlen){
-            std::stringstream error_message;
-            error_message << "Badly formatted height in coinbase!coinbaseInputScript size:" << coinbaseInputScript.size() << " numlen:" << (uint64_t)numlen;
-            throw std::runtime_error(error_message.str());
-        }
-        std::vector<unsigned char> heightScript(numlen);
-        copy(coinbaseInputScript.begin() + 1, coinbaseInputScript.begin() + 1 + numlen, heightScript.begin());
-        CScriptNum coinbaseHeight(heightScript, false, numlen);
-        scriptSigHeight = coinbaseHeight.getint();
-    }
-
-}
-
 bool CheckCoinbase(const CTransaction& tx, CValidationState& state, uint64_t maxTxSigOpsCountConsensusBeforeGenesis, uint64_t maxTxSizeConsensus, bool isGenesisEnabled, const uint256& prevBlockHash, int blockHeight)
 {
-    int kycV1ActivationHeight = 824189;
-    int kycV2ActivationHeight = 927000;
-    if(gBlockProductionTest){
-        kycV2ActivationHeight = 824200;
-    }
-    int kycV1ActivationTipHeight = kycV1ActivationHeight - 1;
-    int kycV2ActivationTipHeight = kycV2ActivationHeight - 1;
-
-    // Use block height being validated when provided (>=0); otherwise fall back to chain tip (e.g. wallet/test).
-    // Using the block's height ensures the same block always gets the same checker (FilledMinerBill vs FilledMinerBillV2),
-    // avoiding non-determinism when chainActive.Height() differs across threads.
-    int checkBlockheight = (blockHeight >= 0) ? blockHeight : chainActive.Height();
-
-    if (isGenesisEnabled) {
-        uint64_t scriptSigHeight{0};
-        HeightFormScript(tx,scriptSigHeight);
-        if ((checkBlockheight >= kycV1ActivationTipHeight) && (scriptSigHeight >= (uint64_t)kycV1ActivationHeight) && tx.nVersion != 10) {
-            std::stringstream error_message;
-            error_message << "bad-cbtx-nVersion:" << tx.nVersion  \
-                << " checkBlockheight:" << checkBlockheight << " scriptSigHeight:" << scriptSigHeight;
-            return state.Invalid(false, 0, "", error_message.str());
-        }
-
-        // Miner KYC veriry.
-        if (checkBlockheight >= kycV1ActivationTipHeight && scriptSigHeight >= (uint64_t)kycV1ActivationHeight) {
-            if (checkBlockheight >= kycV2ActivationTipHeight && scriptSigHeight >= (uint64_t)kycV2ActivationHeight) {
-                if (!FilledMinerBillV2(tx, prevBlockHash)) {
-                    LogPrintf("Judgment condition %d checkBlockheight=%d sigHeight=%d\n",
-                        kycV2ActivationHeight,
-                        checkBlockheight,
-                        scriptSigHeight);
-                    return state.DoS(100, false, REJECT_INVALID, "bad-miner-bill-v2");
-                }
-            } else {
-                if (!FilledMinerBill(tx)) {
-                    LogPrintf("Judgment condition %d checkBlockheight=%d sigHeight=%d\n",
-                        kycV1ActivationHeight,
-                        checkBlockheight,
-                        scriptSigHeight);
-                    return state.DoS(100, false, REJECT_INVALID, "bad-miner-bill");
-                }
-            }
-        }
-    }
-    
+    // Validate the coinbase before parsing miner-bill data. In particular,
+    // FilledMinerBillV2() calculates the total output value, which throws for
+    // outputs outside the valid money range.
     if (!tx.IsCoinBase()) {
         return state.DoS(100, false, REJECT_INVALID, "bad-cb-missing", false,
                          "first tx is not coinbase");
     }
 
-    if (!CheckTransactionCommon(tx, state, maxTxSigOpsCountConsensusBeforeGenesis, maxTxSizeConsensus, isGenesisEnabled)) {
-        // CheckTransactionCommon fill in the state.
+    if (!CheckTransactionCommon(tx, state,
+                                maxTxSigOpsCountConsensusBeforeGenesis,
+                                maxTxSizeConsensus, isGenesisEnabled)) {
+        // CheckTransactionCommon fills in the state.
         return false;
     }
 
@@ -1044,6 +1140,60 @@ bool CheckCoinbase(const CTransaction& tx, CValidationState& state, uint64_t max
         return state.DoS(100, false, REJECT_INVALID, "bad-cb-length");
     }
 
+    if (isGenesisEnabled) {
+        CoinbaseHeightPrefix coinbaseHeight;
+        const bool hasValidHeight =
+            !tx.vin.empty() &&
+            ParseCoinbaseHeightPrefix(tx.vin[0].scriptSig, coinbaseHeight);
+        const uint64_t scriptSigHeight =
+            hasValidHeight ? coinbaseHeight.height : UINT64_MAX;
+
+        // Consensus callers provide the candidate block's real height. Calls
+        // without block context retain compatibility by using the encoded
+        // coinbase height.
+        const uint64_t checkBlockHeight =
+            blockHeight >= 0 ? static_cast<uint64_t>(blockHeight)
+                             : scriptSigHeight;
+
+        constexpr int kycV1ActivationHeight = 824189;
+        constexpr int kycV2ActivationHeight = 927000;
+        
+        if (checkBlockHeight >=
+                static_cast<uint64_t>(kycV1ActivationHeight) &&
+            tx.nVersion != 10) {
+            std::stringstream errorMessage;
+            errorMessage << "bad-cbtx-nVersion:" << tx.nVersion
+                         << " checkBlockheight:" << checkBlockHeight
+                         << " scriptSigHeight:" << scriptSigHeight;
+            return state.Invalid(false, 0, "", errorMessage.str());
+        }
+
+        // Select the KYC version solely from the candidate block's real height
+        // when block context is available.
+        if (checkBlockHeight >=
+            static_cast<uint64_t>(kycV2ActivationHeight)) {
+            if (!FilledMinerBillV2(tx, prevBlockHash)) {
+                LogPrintf(
+                    "Judgment condition %d checkBlockheight=%d "
+                    "sigHeight=%d\n",
+                    kycV2ActivationHeight, checkBlockHeight,
+                    scriptSigHeight);
+                return state.DoS(
+                    100, false, REJECT_INVALID, "bad-miner-bill-v2");
+            }
+        } else if (checkBlockHeight >=
+                   static_cast<uint64_t>(kycV1ActivationHeight)) {
+            if (!FilledMinerBill(tx)) {
+                LogPrintf(
+                    "Judgment condition %d checkBlockheight=%d "
+                    "sigHeight=%d\n",
+                    kycV1ActivationHeight, checkBlockHeight,
+                    scriptSigHeight);
+                return state.DoS(
+                    100, false, REJECT_INVALID, "bad-miner-bill");
+            }
+        }
+    }
     return true;
 }
 
@@ -1311,74 +1461,17 @@ static bool CheckMempoolMinFee(
     return true;
 }
 
-static bool CheckTxRelayPriority(
-    const Amount& nModifiedFees,
-    const CFeeRate& minRelayTxFee,
-    const CTxMemPoolEntry& pMempoolEntry,
-    unsigned int nTxSize) {
-    // Check txn relay priority
-    if (gArgs.GetBoolArg("-relaypriority", DEFAULT_RELAYPRIORITY) &&
-        nModifiedFees < minRelayTxFee.GetFee(nTxSize) &&
-        !AllowFree(pMempoolEntry.GetPriority(chainActive.Height() + 1))) {
-        // Require that free transactions have sufficient priority to be
-        // mined in the next block.
-        return false;
-    }
-    return true;
-}
-
-static bool CheckLimitFreeTx(
-    const Config& config,
-    bool fLimitFree,
-    const Amount& nModifiedFees,
-    const CFeeRate& minRelayTxFee,
-    unsigned int nTxSize) {
-    // Continuously rate-limit free (really, very-low-fee) transactions.
-    // This mitigates 'penny-flooding' -- sending thousands of free
-    // transactions just to be annoying or make others' transactions take
-    // longer to confirm.
-    if (!(fLimitFree && nModifiedFees < minRelayTxFee.GetFee(nTxSize))) {
-        return true;
-    }
-    static CCriticalSection csFreeLimiter;
-    static double dFreeCount;
-    static int64_t nLastTime;
-    int64_t nNow = GetTime();
-
-    LOCK(csFreeLimiter);
-
-    // Use an exponentially decaying ~10-minute window:
-    dFreeCount *= pow(1.0 - 1.0 / 600.0, double(nNow - nLastTime));
-    nLastTime = nNow;
-    // -limitfreerelay unit is thousand-bytes-per-minute
-    // At default rate it would take over a month to fill 1GB
-    if (dFreeCount + nTxSize >=
-        config.GetLimitFreeRelay() * 10) {
-        return false;
-    }
-
-    LogPrint(BCLog::MEMPOOL, "Rate limit dFreeCount: %g => %g\n",
-             dFreeCount, dFreeCount + nTxSize);
-    dFreeCount += nTxSize;
-    return true;
-}
 
 static bool CalculateMempoolAncestors(
     const CTxMemPool &pool,
     const CTxMemPoolEntry& pMempoolEntry,
     CTxMemPool::setEntries& setAncestors,
     std::string& errString) {
-    // Calculate in-mempool ancestors, up to a limit.
-    size_t nLimitAncestors = GlobalConfig::GetConfig().GetLimitAncestorCount();
-    size_t nLimitAncestorSize = GlobalConfig::GetConfig().GetLimitAncestorSize();
-    size_t nLimitDescendants = GlobalConfig::GetConfig().GetLimitDescendantCount();
-    size_t nLimitDescendantSize = GlobalConfig::GetConfig().GetLimitDescendantSize();
+    // Calculate in-mempool ancestors, up to the configured chain height.
+    size_t nLimitAncestorHeight = GlobalConfig::GetConfig().GetLimitAncestorCount();
     if (!pool.CalculateMemPoolAncestors(pMempoolEntry,
                 setAncestors,
-                nLimitAncestors,
-                nLimitAncestorSize,
-                nLimitDescendants,
-                nLimitDescendantSize,
+                nLimitAncestorHeight,
                 errString)) {
         return false;
     }
@@ -1435,19 +1528,18 @@ std::vector<TxId> LimitMempoolSize(
     size_t limit,
     unsigned long age) {
 
+    // No-trim policy: the mempool is never evicted to satisfy a size limit.
+    // Admission is bounded instead by a size-dependent fee floor plus rejection
+    // once current usage reaches N2 (see CTxnValidation / CTxMemPool::GetMinFee).
+    // Here we only drop transactions that have aged past the expiry window.
+    (void)limit;
     int expired = pool.Expire(GetTime() - age, changeSet);
     if (expired != 0) {
         LogPrint(BCLog::MEMPOOL,
                  "Expired %i transactions from the memory pool\n", expired);
     }
 
-    std::vector<COutPoint> vNoSpendsRemaining;
-    std::vector<TxId> vRemovedTxIds = pool.TrimToSize(
-                                                limit,
-                                                changeSet,
-                                                &vNoSpendsRemaining);
-    pcoinsTip->Uncache(vNoSpendsRemaining);
-    return vRemovedTxIds;
+    return {};
 }
 
 void CommitTxToMempool(
@@ -1482,19 +1574,14 @@ void CommitTxToMempool(
             changeSet,
             pnMempoolSize,
             pnDynamicMemoryUsage);
-    // Check if the mempool size needs to be limited.
+    // Expire aged transactions. Under the no-trim policy no size-based eviction
+    // occurs here; TxnValidation performs size-cap rejection before insertion.
     if (fLimitMempoolSize) {
-        // Trim mempool and check if tx was trimmed.
         LimitMempoolSize(
             pool,
             changeSet,
             GlobalConfig::GetConfig().GetMaxMempool(),
             GlobalConfig::GetConfig().GetMemPoolExpiry());
-        if (!pool.Exists(txid)) {
-            state.DoS(0, false, REJECT_INSUFFICIENTFEE,
-                     "mempool full");
-            return;
-        }
     }
 }
 
@@ -1536,7 +1623,6 @@ CTxnValResult TxnValidation(
     const CTransactionRef& ptx = pTxInputData->GetTxnPtr();
     const CTransaction &tx = *ptx;
     const TxId txid = tx.GetId();
-    const bool fLimitFree = pTxInputData->IsLimitFree();
     const int64_t nAcceptTime = pTxInputData->GetAcceptTime();
     const Amount nAbsurdFee = pTxInputData->GetAbsurdFee();
 
@@ -1809,6 +1895,7 @@ CTxnValResult TxnValidation(
     }
 
     Amount nFees = nValueIn - tx.GetValueOut();
+
     if (!IsAbsurdlyHighFeeSetForTxn(nFees, nAbsurdFee)) {
         state.Invalid(false, REJECT_HIGHFEE,
                      "absurdly-high-fee",
@@ -1821,14 +1908,22 @@ CTxnValResult TxnValidation(
     // Calculate tx's size.
     const unsigned int nTxSize = ptx->GetTotalSize();
 
-    // Make sure that underfunded consolidation transactions still pass.
+    // Make sure that underfunded consolidation transactions still pass, but
+    // only while the mempool is in the flat-floor stage (usage <= N1 ==
+    // -mempoolfeerampstart). The free-consolidation subsidy is a courtesy that
+    // only applies when there is spare capacity; once usage crosses N1 and the
+    // admission feerate starts ramping, consolidation txns get no subsidy and
+    // must meet the (rising) floor like any other transaction. A zero-fee
+    // consolidation will then simply fail the fee test below, while one paying
+    // a voluntary fee high enough to cover the ramped floor is still admitted.
     // Note that consolidation transactions paying a voluntary fee will
     // be treated with higher priority. The higher the fee the higher
     // the priority
-    bool skipFeeTest = IsConsolidationTxn(config, tx, view, chainActive.Height() + 1);
-    if (skipFeeTest) {
+    const bool isConsolidationTxn = IsConsolidationTxn(config, tx, view, chainActive.Height() + 1);
+    if (isConsolidationTxn &&
+        pool.DynamicMemoryUsage() <= config.GetMempoolFeeRampStart()) {
         double priority = 0;
-        const CFeeRate blockMinTxFee = config.GetBlockMinFeePerKB();
+        const CFeeRate blockMinTxFee = pool.GetBlockMinTxFee();
         const Amount consolidationDelta = blockMinTxFee.GetFee(nTxSize);
         pool.PrioritiseTransaction(txid, txid.ToString(), priority, consolidationDelta);
         LogPrint(BCLog::TXNVAL,"free consolidation transaction detected, txid:=%s\n", tx.GetId().ToString());
@@ -1840,12 +1935,29 @@ CTxnValResult TxnValidation(
     Amount inChainInputValue;
     double dPriority =
         view.GetPriority(tx, chainActive.Height(), inChainInputValue);
+
     // Keep track of transactions that spend a coinbase, which we re-scan
     // during reorgs to ensure COINBASE_MATURITY is still met.
     const bool fSpendsCoinbase = CheckTxSpendsCoinbase(tx, view);
 
-    // Check mempool minimal fee requirement.
+    // No-trim policy: transactions are not evicted to enforce size, so reject
+    // once current usage reaches protection threshold N2 (-maxmempool). This
+    // gate is unconditional. It also bounds reorg resurrection:
+    // disconnected-block txns are re-added via
+    // CTxnValidation (UpdateMempoolForReorg -> processValidation), so once usage
+    // hits N2 the remaining resurrected txns are rejected here rather than being
+    // added and trimmed afterwards. The cubic fee floor below makes admission
+    // increasingly expensive before N2; the hard gate protects capacity once
+    // N2 is reached.
+    if (pool.DynamicMemoryUsage() >= config.GetMaxMempool()) {
+        state.DoS(0, false, REJECT_INSUFFICIENTFEE,
+                 "mempool full");
+        return Result{state, pTxInputData, vCoinsToUncache};
+    }
+
+    // Size-based admission fee floor (rises cubically from N1 toward N2).
     const Amount& nMempoolRejectFee = GetMempoolRejectFee(config, pool, nTxSize);
+
     if(!CheckMempoolMinFee(nModifiedFees, nMempoolRejectFee)) {
         state.DoS(0, false, REJECT_INSUFFICIENTFEE,
                  "mempool min fee not met",
@@ -1871,26 +1983,6 @@ CTxnValResult TxnValidation(
             fSpendsCoinbase,
             nSigOpsCount,
             lp) };
-    if (!skipFeeTest) {
-        // Check tx's priority based on relaypriority flag and relay fee.
-        const CFeeRate minRelayTxFee = config.GetMinFeePerKB();
-        if (!CheckTxRelayPriority(nModifiedFees, minRelayTxFee, *pMempoolEntry, nTxSize)) {
-            // Require that free transactions have sufficient priority to be
-            // mined in the next block.
-            state.DoS(0, false, REJECT_INSUFFICIENTFEE,
-                      "insufficient priority");
-            return Result{state, pTxInputData, vCoinsToUncache};
-        }
-        // Continuously rate-limit free (really, very-low-fee) transactions.
-        // This mitigates 'penny-flooding' -- sending thousands of free
-        // transactions just to be annoying or make others' transactions take
-        // longer to confirm.
-    	if (!CheckLimitFreeTx(config, fLimitFree, nModifiedFees, minRelayTxFee, nTxSize)){
-            state.DoS(0, false, REJECT_INSUFFICIENTFEE,
-                      "rate limited free transaction");
-            return Result{state, pTxInputData, vCoinsToUncache};
-        }
-    }
     // Calculate in-mempool ancestors, up to a limit.
     CTxMemPool::setEntries setAncestors;
     std::string errString;
@@ -2557,11 +2649,9 @@ static void PostValidationStepsForP2PTxn(
         pNode->nLastTXTime = GetTime();
     }
     else {
-        // For P2P txns the Validator executes LimitMempoolSize when a batch of txns is
-        // fully processed (validation is finished and all valid txns were commited)
-        // so the else condition can not be interpreted if limit mempool size flag
-        // is set on transaction level. As a consequence AddToCompactExtraTransactions is not
-        // being called for txns added and then removed from the mempool.
+        // Size-cap failures are rejected by TxnValidation before insertion.
+        // LimitMempoolSize performs expiry-only cleanup and cannot turn a
+        // successfully committed transaction into an insufficient-fee failure.
 
         // Create and send a reject message when all the following conditions are met:
         // a) the txn is fully processed
@@ -8001,7 +8091,7 @@ bool LoadMempool(const Config &config, const task::CCancellationToken& shutdownT
                             nTime, // nAcceptTime
                             true),  // fLimitFree
                         changeSet, // an instance of the mempool journal
-                        true) // fLimitMempoolSize
+                        true) // run mempool expiry cleanup
                 };
                 // Check results
                 if (state.IsValid()) {

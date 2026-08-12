@@ -280,18 +280,6 @@ std::string EntryDescriptionString() {
            "transaction entered pool\n"
            "    \"currentpriority\" : n,  (numeric) DEPRECATED. Transaction "
            "priority now\n"
-           "    \"descendantcount\" : n,  (numeric) number of in-mempool "
-           "descendant transactions (including this one)\n"
-           "    \"descendantsize\" : n,   (numeric) virtual transaction size "
-           "of in-mempool descendants (including this one)\n"
-           "    \"descendantfees\" : n,   (numeric) modified fees (see above) "
-           "of in-mempool descendants (including this one)\n"
-           "    \"ancestorcount\" : n,    (numeric) number of in-mempool "
-           "ancestor transactions (including this one)\n"
-           "    \"ancestorsize\" : n,     (numeric) virtual transaction size "
-           "of in-mempool ancestors (including this one)\n"
-           "    \"ancestorfees\" : n,     (numeric) modified fees (see above) "
-           "of in-mempool ancestors (including this one)\n"
            "    \"depends\" : [           (array) unconfirmed transactions "
            "used as inputs for this transaction\n"
            "        \"transactionid\",    (string) parent transaction id\n"
@@ -307,14 +295,6 @@ void entryToJSONNL(UniValue &info, const CTxMemPoolEntry &e) {
     info.push_back(Pair("startingpriority", e.GetPriority(e.GetHeight())));
     info.push_back(
         Pair("currentpriority", e.GetPriority(chainActive.Height())));
-    info.push_back(Pair("descendantcount", e.GetCountWithDescendants()));
-    info.push_back(Pair("descendantsize", e.GetSizeWithDescendants()));
-    info.push_back(
-        Pair("descendantfees", e.GetModFeesWithDescendants().GetSatoshis()));
-    info.push_back(Pair("ancestorcount", e.GetCountWithAncestors()));
-    info.push_back(Pair("ancestorsize", e.GetSizeWithAncestors()));
-    info.push_back(
-        Pair("ancestorfees", e.GetModFeesWithAncestors().GetSatoshis()));
     const CTransaction &tx = e.GetTx();
     std::set<std::string> setDepends;
     for (const CTxIn &txin : tx.vin) {
@@ -460,8 +440,8 @@ UniValue getmempoolancestors(const Config &config,
     CTxMemPool::setEntries setAncestors;
     uint64_t noLimit = std::numeric_limits<uint64_t>::max();
     std::string dummy;
-    mempool.CalculateMemPoolAncestorsNL(*txIter, setAncestors, noLimit, noLimit,
-                                        noLimit, noLimit, dummy, false);
+    mempool.CalculateMemPoolAncestorsNL(
+        *txIter, setAncestors, noLimit, dummy, false);
     if (!fVerbose) {
         UniValue o(UniValue::VARR);
         for (CTxMemPool::txiter ancestorIt : setAncestors) {
@@ -1788,9 +1768,19 @@ UniValue mempoolInfoToJSON(const Config& config) {
              (int64_t)mempool.getNonFinalPool().estimateMemoryUsage()));
     size_t maxmempool = config.GetMaxMempool();
     ret.push_back(Pair("maxmempool", (int64_t)maxmempool));
+    // Current size-dependent admission fee floor (the curve evaluated at the
+    // current usage). Below the ramp start it equals mempoolfloorfee; as usage
+    // approaches maxmempool it follows an alpha=3 reciprocal ramp up to the
+    // policy fee-rate ceiling.
     ret.push_back(
         Pair("mempoolminfee",
              ValueFromAmount(mempool.GetMinFee(maxmempool).GetFeePerK())));
+    // Curve parameters, so the value above can be interpreted.
+    ret.push_back(
+        Pair("mempoolfloorfee",
+             ValueFromAmount(config.GetMempoolMinFeePerKB().GetFeePerK())));
+    ret.push_back(
+        Pair("mempoolfeerampstart", (int64_t)config.GetMempoolFeeRampStart()));
 
     return ret;
 }
@@ -1812,10 +1802,17 @@ UniValue getmempoolinfo(const Config &config, const JSONRPCRequest &request) {
             "the mempool\n"
             "  \"nonfinalusage\": xxxxx,      (numeric) Total memory usage for "
             "the non-final mempool\n"
-            "  \"maxmempool\": xxxxx,         (numeric) Maximum memory usage "
-            "for the mempool\n"
-            "  \"mempoolminfee\": xxxxx       (numeric) Minimum fee for tx to "
-            "be accepted\n"
+            "  \"maxmempool\": xxxxx,         (numeric) N2 mempool "
+            "admission protection threshold; new transactions are rejected "
+            "once reached\n"
+            "  \"mempoolminfee\": xxxxx,      (numeric) Current minimum feerate "
+            "for a tx to be accepted, given current mempool usage. Follows "
+            "an alpha=3 reciprocal ramp, capped at the policy ceiling\n"
+            "  \"mempoolfloorfee\": xxxxx,    (numeric) Configured admission fee "
+            "floor charged while usage is below mempoolfeerampstart "
+            "(-mempoolminfeerate)\n"
+            "  \"mempoolfeerampstart\": xxxxx (numeric) Mempool usage (bytes) "
+            "below which mempoolminfee equals mempoolfloorfee (-mempoolfeerampstart)\n"
             "}\n"
             "\nExamples:\n" +
             HelpExampleCli("getmempoolinfo", "") +
@@ -2157,13 +2154,13 @@ static UniValue getblockstats(const Config &config,
 
     LOCK(cs_main);
 
-    CBlockIndex *pindex;
     const std::string strHash = request.params[0].get_str();
     const uint256 hash(uint256S(strHash));
-    pindex = mapBlockIndex[hash];
-    if (!pindex) {
+    const auto it = mapBlockIndex.find(hash);
+    if (it == mapBlockIndex.end() || !it->second) {
         throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Block not found");
     }
+    CBlockIndex *pindex = it->second;
     if (!chainActive.Contains(pindex)) {
         throw JSONRPCError(RPC_INVALID_PARAMETER,
                             strprintf("Block is not in chain %s",
@@ -2692,13 +2689,22 @@ static const CRPCCommand commands[] = {
     { "hidden",             "waitforblockheight",     waitforblockheight,     true,  {"height","timeout"} },
     { "hidden",             "getblockchainactivity",  getblockchainactivity,  true,  {} },
     { "hidden",             "getcurrentlyvalidatingblocks",     getcurrentlyvalidatingblocks,     true,  {} },
-    { "hidden",             "waitaftervalidatingblock",         waitaftervalidatingblock,         true,  {"blockhash","action"} },
     { "hidden",             "getwaitingblocks",                 getwaitingblocks,            true,  {} }
+};
+
+static const CRPCCommand waitAfterValidatingBlockCommand {
+    "hidden", "waitaftervalidatingblock", waitaftervalidatingblock, true,
+    {"blockhash", "action"}
 };
 // clang-format on
 
 void RegisterBlockchainRPCCommands(CRPCTable &t) {
     for (unsigned int vcidx = 0; vcidx < ARRAYLEN(commands); vcidx++) {
         t.appendCommand(commands[vcidx].name, &commands[vcidx]);
+    }
+
+    if (Params().NetworkIDString() == CBaseChainParams::REGTEST) {
+        t.appendCommand(waitAfterValidatingBlockCommand.name,
+                        &waitAfterValidatingBlockCommand);
     }
 }
